@@ -3,15 +3,16 @@ import io
 import re
 import csv
 import time
+import json
 import base64
+import difflib
 import requests
 from datetime import datetime
-import difflib
-from flask import Flask, request, Response
+from flask import Flask, request, Response, abort
 
-# =============================
-# SSL FIX (Windows / requests)
-# =============================
+# =========================
+# SSL fix (Windows) - não atrapalha no Linux
+# =========================
 try:
     import certifi
     os.environ["SSL_CERT_FILE"] = certifi.where()
@@ -20,116 +21,117 @@ except Exception:
 
 app = Flask(__name__)
 
-# =============================
+# =========================
 # CONFIG
-# =============================
+# =========================
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "1234")
-USER_AGENT = os.environ.get("USER_AGENT", "rota-privada-web/6.0A")
+USER_AGENT = os.environ.get("USER_AGENT", "rota-privada-web/6.0A.1")
+
 COUNTRY = "Brazil"
 
-# Nominatim etiquette: 1 req/s-ish. Dá pra baixar um pouco, mas não abusa.
-SLEEP_NOMINATIM = float(os.environ.get("SLEEP_NOMINATIM", "0.85"))
+# Mais rápido, mas ainda "educado" com Nominatim (ajuste se precisar)
+SLEEP_NOMINATIM = float(os.environ.get("SLEEP_NOMINATIM", "0.65"))
 
-# “Caixa” aproximada de Manaus (pra evitar mandar ponto pra outro bairro/estado/planeta)
-MANAUS_VIEWBOX = (-60.30, -3.25, -59.80, -2.85)
+# Manaus (viewbox aproximado) — segura muito “ponto perdido”
+MANAUS_VIEWBOX = (-60.30, -3.25, -59.80, -2.85)  # west, south, east, north
 
-# Cache em memória (Render Free pode reiniciar — ok, cache é bônus)
-# chave -> (lat, lon, updated_at_iso)
-GEO_CACHE = {}
+# Timeouts (conexão, leitura) — evita travar infinito
+TIMEOUT_VIACEP = (5, 10)
+TIMEOUT_NOMINATIM = (5, 12)
 
-# Cache ViaCEP em memória (evita repetir consulta de CEP)
-VIA_CACHE = {}
+# Score mínimo pra aceitar “caça nome antigo”
+MIN_SCORE_CACADO = float(os.environ.get("MIN_SCORE_CACADO", "0.42"))
 
-
-# =============================
-# HTML (página simples)
-# =============================
+# =========================
+# HTML (1 arquivo só)
+# =========================
 HTML = r"""
 <!doctype html>
 <html lang="pt-br">
 <head>
   <meta charset="utf-8" />
-  <title>Roteirizador Privado v6.0A</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Roteirizador Privado v6.0A.1</title>
   <style>
-    body { font-family: Arial, sans-serif; background:#fff; color:#111; }
-    .wrap { max-width: 860px; margin: 40px auto; padding: 0 16px; }
-    h1 { text-align:center; font-size: 28px; margin-bottom: 6px; }
-    .sub { text-align:center; color:#555; margin-top:0; margin-bottom: 24px; }
-    .card { border:1px solid #ddd; border-radius: 12px; padding: 18px; }
-    label { display:block; font-weight: 600; margin-top: 10px; }
-    input[type=password] { width: 260px; padding: 10px; border:1px solid #ccc; border-radius: 10px; }
-    textarea { width: 100%; height: 320px; padding: 12px; border:1px solid #ccc; border-radius: 10px; font-family: Consolas, monospace; font-size: 13px; }
-    button { padding: 10px 14px; border:0; border-radius: 10px; background:#111; color:#fff; cursor:pointer; font-weight: 700; }
-    button[disabled] { opacity: .5; cursor:not-allowed; }
-    .row { display:flex; gap: 12px; align-items:center; flex-wrap: wrap; }
-    .hint { color:#666; margin: 10px 0 6px; font-size: 13px; }
-    .status { margin-top: 10px; font-size: 14px; color:#333; }
-    .barbox { margin-top: 10px; height: 14px; background:#eee; border-radius: 999px; overflow:hidden; display:none; }
-    .bar { height: 14px; width: 0%; background:#111; }
-    .pct { margin-top: 6px; font-size: 13px; color:#555; display:none; }
-    .footer { margin-top: 10px; font-size: 12px; color:#777; }
-    .ok { color: #0a7a2a; font-weight: 700; }
-    .err { color: #b00020; font-weight: 700; }
+    body{font-family:Arial,Helvetica,sans-serif;background:#fff;color:#111;margin:0}
+    .wrap{max-width:900px;margin:40px auto;padding:0 18px}
+    h1{font-size:26px;margin:0 0 14px 0}
+    .card{border:1px solid #ddd;border-radius:10px;padding:16px}
+    label{font-weight:700}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+    input[type=password]{padding:10px;border:1px solid #ccc;border-radius:8px;min-width:240px}
+    button{padding:10px 14px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}
+    button:disabled{opacity:.55;cursor:not-allowed}
+    textarea{width:100%;min-height:320px;margin-top:8px;border:1px solid #ccc;border-radius:10px;padding:12px;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+    .muted{color:#666;font-size:12px;margin-top:8px}
+    .barWrap{margin-top:10px}
+    .bar{height:14px;border-radius:999px;background:#eee;overflow:hidden}
+    .fill{height:100%;width:0;background:#111;transition:width .12s linear}
+    .status{font-family:ui-monospace,Consolas,monospace;font-size:12px;margin-top:6px;color:#333}
+    .ok{color:#0a7}
+    .warn{color:#c70}
+    .err{color:#c00}
   </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>Roteirizador Privado <span style="font-size:12px;color:#777;border:1px solid #ddd;border-radius:10px;padding:3px 8px;vertical-align:middle;">v6.0A</span></h1>
-  <p class="sub">Cole o texto bagunçado (Shopee/Loggi/etc). Eu extraio endereços e gero um CSV pronto pro Circuit.</p>
+  <div class="wrap">
+    <h1>Roteirizador Privado <small style="font-size:12px;border:1px solid #ddd;border-radius:999px;padding:3px 8px;color:#333;">v6.0A.1</small></h1>
 
-  <div class="card">
-    <div class="hint">
-      Dica raiz: se a linha tiver <b>rua + número + CEP</b>, é sucesso. Se estiver quebrado, eu tento juntar.
-      Se algum cair em “fallback”, vai com <b>logradouro/bairro do ViaCEP</b> (não fica só “CEP seco”).
-    </div>
+    <div class="card">
+      <div class="muted">
+        Cole o texto bagunçado (Shopee/Loggi/Mercado Livre etc). Eu tento achar os endereços e gero um CSV pronto pro Circuit.
+        <br><b>Dica:</b> se tiver CEP + rua na mesma linha, melhor. Mas eu também tento juntar linha quebrada.
+      </div>
 
-    <div class="row">
+      <div class="row" style="margin-top:10px">
+        <div>
+          <label>Senha:</label><br/>
+          <input id="pwd" type="password" placeholder="APP_PASSWORD" />
+        </div>
+        <div style="padding-top:18px">
+          <button id="btn">Gerar CSV</button>
+        </div>
+      </div>
+
       <div>
-        <label>Senha</label>
-        <input id="pw" type="password" placeholder="APP_PASSWORD" />
+        <label style="display:block;margin-top:12px">Cole aqui:</label>
+        <textarea id="txt" placeholder="Cole aqui sua lista bagunçada..."></textarea>
       </div>
-      <div style="margin-top:28px;">
-        <button id="btn">Gerar CSV</button>
+
+      <div class="barWrap">
+        <div class="muted" id="hint">Quando começar, vai aparecer barra de progresso e status (sem drama).</div>
+        <div class="bar"><div class="fill" id="fill"></div></div>
+        <div class="status" id="status"></div>
       </div>
-    </div>
 
-    <label style="margin-top:14px;">Cole aqui</label>
-    <textarea id="txt" placeholder="Cole aqui sua lista bagunçada..."></textarea>
-
-    <div class="status" id="status"></div>
-    <div class="barbox" id="barbox"><div class="bar" id="bar"></div></div>
-    <div class="pct" id="pct"></div>
-
-    <div class="footer">
-      Saída: <b>circuit_import_*.csv</b> (download automático). Se algo ficar duvidoso, vai em <b>Notes</b> com o motivo.
+      <div class="muted">
+        Saída: <b>circuit_import_*.csv</b> (download automático). Se cair em fallback, vai em <b>Notes</b> com motivo.
+      </div>
     </div>
   </div>
-</div>
 
 <script>
-const btn = document.getElementById('btn');
-const statusEl = document.getElementById('status');
-const barbox = document.getElementById('barbox');
-const bar = document.getElementById('bar');
-const pct = document.getElementById('pct');
+const btn = document.getElementById("btn");
+const txt = document.getElementById("txt");
+const pwd = document.getElementById("pwd");
+const fill = document.getElementById("fill");
+const statusEl = document.getElementById("status");
+const hint = document.getElementById("hint");
 
-function setProgress(p, msg){
-  barbox.style.display = 'block';
-  pct.style.display = 'block';
-  bar.style.width = `${p}%`;
-  pct.textContent = `${p.toFixed(1)}% — ${msg || ""}`;
+function setProgress(p){
+  fill.style.width = Math.max(0, Math.min(100, p)) + "%";
 }
 
-function setStatus(html){
-  statusEl.innerHTML = html || "";
+function setStatus(msg, cls){
+  statusEl.className = "status " + (cls || "");
+  statusEl.textContent = msg || "";
 }
 
-function downloadBase64Csv(b64, filename){
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
-  const blob = new Blob([bytes], {type: "text/csv;charset=utf-8"});
+function downloadBase64(b64, filename){
+  const byteChars = atob(b64);
+  const byteNums = new Array(byteChars.length);
+  for(let i=0;i<byteChars.length;i++) byteNums[i] = byteChars.charCodeAt(i);
+  const blob = new Blob([new Uint8Array(byteNums)], {type:"text/csv;charset=utf-8"});
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -137,72 +139,74 @@ function downloadBase64Csv(b64, filename){
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(()=>URL.revokeObjectURL(url), 2000);
+  URL.revokeObjectURL(url);
 }
 
-btn.addEventListener('click', async () => {
-  const text = document.getElementById('txt').value || "";
-  const password = document.getElementById('pw').value || "";
+btn.addEventListener("click", async () => {
+  const payload = txt.value || "";
+  const pass = pwd.value || "";
 
-  if (!password) { setStatus('<span class="err">Bota a senha aí.</span>'); return; }
-  if (text.trim().length < 10) { setStatus('<span class="err">Cole alguma coisa no texto.</span>'); return; }
+  if(!payload.trim()){
+    alert("Cole o texto primeiro :)");
+    return;
+  }
 
   btn.disabled = true;
-  setStatus('Iniciando… não fecha a página.');
-  setProgress(0.1, "preparando");
+  hint.textContent = "Processando... não fecha a página.";
+  setProgress(0);
+  setStatus("Iniciando...", "warn");
 
-  try {
-    const resp = await fetch('/process_stream', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ password, text })
+  try{
+    const resp = await fetch("/process_stream", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({password: pass, text: payload})
     });
 
-    if (!resp.ok) {
+    if(!resp.ok){
       const t = await resp.text();
-      throw new Error(t || `HTTP ${resp.status}`);
+      alert("Erro: " + t);
+      btn.disabled = false;
+      return;
     }
 
     const reader = resp.body.getReader();
-    const decoder = new TextDecoder('utf-8');
+    const decoder = new TextDecoder("utf-8");
     let buffer = "";
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
+    while(true){
+      const {value, done} = await reader.read();
+      if(done) break;
       buffer += decoder.decode(value, {stream:true});
 
-      // processa linhas JSONL
       let idx;
-      while ((idx = buffer.indexOf("\n")) >= 0) {
+      while((idx = buffer.indexOf("\n")) >= 0){
         const line = buffer.slice(0, idx).trim();
-        buffer = buffer.slice(idx + 1);
-        if (!line) continue;
+        buffer = buffer.slice(idx+1);
 
-        let evt;
-        try { evt = JSON.parse(line); } catch(e){ continue; }
+        if(!line) continue;
+        let msg;
+        try{ msg = JSON.parse(line); }catch(e){ continue; }
 
-        if (evt.type === "progress") {
-          setProgress(evt.percent || 0, evt.msg || "");
-          setStatus(`Processando: <b>${evt.current}</b>/<b>${evt.total}</b>`);
+        if(msg.type === "progress"){
+          setProgress(msg.percent || 0);
+          setStatus(`${(msg.percent||0).toFixed(1)}%  (${msg.current}/${msg.total})  ${msg.msg||""}`, "warn");
         }
-        if (evt.type === "warn") {
-          setStatus(`<span class="err">${evt.msg}</span>`);
+        else if(msg.type === "done"){
+          setProgress(100);
+          setStatus(`Finalizado! OK: ${msg.ok} | Revisar: ${msg.review} | Tempo: ${msg.seconds.toFixed(1)}s`, "ok");
+          downloadBase64(msg.csv_b64, msg.filename);
         }
-        if (evt.type === "done") {
-          setProgress(100, "finalizado");
-          const resumo = `
-            <span class="ok">Finalizado.</span>
-            OK: <b>${evt.ok}</b> — Revisar: <b>${evt.revisar}</b> — Tempo: <b>${evt.seconds.toFixed(1)}s</b>
-          `;
-          setStatus(resumo);
-          downloadBase64Csv(evt.csv_base64, evt.filename);
+        else if(msg.type === "error"){
+          setStatus("Erro: " + (msg.message || "desconhecido"), "err");
+          alert("Erro: " + (msg.message || "desconhecido"));
         }
       }
     }
-  } catch (e) {
-    setStatus(`<span class="err">Deu ruim:</span> ${String(e.message || e)}`);
-  } finally {
+  } catch(e){
+    console.error(e);
+    alert("Falhou: " + e);
+  } finally{
     btn.disabled = false;
   }
 });
@@ -211,83 +215,159 @@ btn.addEventListener('click', async () => {
 </html>
 """
 
-
-# =============================
+# =========================
 # Helpers
-# =============================
+# =========================
+def dentro_de_manaus(lat, lon):
+    west, south, east, north = MANAUS_VIEWBOX
+    return (west <= lon <= east) and (south <= lat <= north)
+
 def normaliza(s: str) -> str:
     s = (s or "").lower().strip()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def similaridade(a: str, b: str) -> float:
+def similaridade(a, b) -> float:
     a = normaliza(a)
     b = normaliza(b)
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a, b).ratio()
 
-def formata_cep(cep: str) -> str:
-    c = re.sub(r"\D", "", cep or "")
+def extrair_cep(texto):
+    # aceita 69027000 ou 69027-000
+    m = re.search(r"\b(\d{5})-?(\d{3})\b", texto)
+    if not m:
+        return None
+    return m.group(1) + m.group(2)
+
+def formata_cep(cep8):
+    c = re.sub(r"\D", "", cep8 or "")
     if len(c) == 8:
         return f"{c[:5]}-{c[5:]}"
-    return cep or ""
+    return (cep8 or "").strip()
 
-def extrair_cep(texto: str):
-    if not texto:
-        return None
-    m = re.search(r"\b(\d{5})-?(\d{3})\b", texto)
-    if m:
-        return f"{m.group(1)}{m.group(2)}"
-    return None
+def extrair_numero(texto):
+    # tenta pegar número de porta (bem “brasileiro”: 10, 10A, 437A etc)
+    m = re.search(r"\b(\d{1,6}[A-Za-z]?)\b", texto)
+    return m.group(1) if m else "S/N"
 
-def linha_tem_via(texto: str) -> bool:
-    if not texto:
-        return False
-    return bool(re.search(r"\b(rua|avenida|av\.|travessa|beco|estrada|alameda|praça|loteamento|conjunto)\b", texto.lower()))
-
-def extrair_numero(texto: str) -> str:
-    if not texto:
-        return "S/N"
-    # tenta achar número “bonito” primeiro
-    m = re.search(r"\b(n[ºo]\s*)?(\d{1,5}[A-Za-z]?)\b", texto)
-    if m:
-        return m.group(2)
-    return "S/N"
-
-def limpar_texto_endereco(texto: str) -> str:
+def limpar_texto_endereco(texto):
     t = (texto or "").replace("N/A", " ")
-    # remove “rastros” gigantes (telefone/códigos)
+    # remove códigos gigantes (rastreamento etc)
     t = re.sub(r"\b\d{9,}\b", " ", t)
+    # limpa espaços
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-def dentro_de_manaus(lat: float, lon: float) -> bool:
-    west, south, east, north = MANAUS_VIEWBOX
-    return (west <= lon <= east) and (south <= lat <= north)
+def linha_parece_endereco(texto):
+    low = (texto or "").lower()
+    via = re.search(r"\b(rua|avenida|av\.|travessa|beco|estrada|alameda|praça|praca)\b", low)
+    cep = extrair_cep(texto or "")
+    # precisa de via e cep pra ser “endereço forte”
+    return bool(via and cep)
 
-def buscar_viacep(cep8: str):
+def eh_linha_ruim(l):
+    l = (l or "").strip()
+    if not l:
+        return True
+    low = l.lower()
+    if low.startswith("pacote de"):
+        return True
+    if re.fullmatch(r"[A-Z0-9_]{8,}", l.replace("-", "").replace(".", "").strip()):
+        # tracking/código
+        return True
+    if "shpx" in low or "logistica" in low or "ltda" in low:
+        # muito comum em linhas não-endereço
+        return True
+    return False
+
+def tentar_pegar_nome(linha_anterior):
+    # nome costuma ser linha anterior do endereço
+    if not linha_anterior:
+        return ""
+    s = linha_anterior.strip()
+    if eh_linha_ruim(s):
+        return ""
+    # se parece endereço, não é nome
+    if linha_parece_endereco(s):
+        return ""
+    # tira emoticons
+    s = s.replace(":^)", "").replace("^)", "").strip()
+    # não deixa nome gigante
+    if len(s) > 60:
+        s = s[:60].rstrip()
+    return s
+
+def extrair_enderecos_do_texto(texto):
+    """
+    Estratégia tradicional (que funciona no mundo real):
+    - quebra por linhas
+    - tenta juntar linha quebrada: se tem "rua/av/trav" mas não tem CEP, cola com próximas 1-2 linhas
+    - aceita endereço quando tem via + CEP
+    - tenta capturar nome na linha anterior
+    """
+    linhas = [l.rstrip() for l in (texto or "").splitlines()]
+    linhas = [l for l in linhas if l.strip()]
+
+    enderecos = []
+    i = 0
+    while i < len(linhas):
+        cur = limpar_texto_endereco(linhas[i])
+
+        # pular lixo
+        if eh_linha_ruim(cur):
+            i += 1
+            continue
+
+        cep = extrair_cep(cur)
+        tem_via = re.search(r"\b(rua|avenida|av\.|travessa|beco|estrada|alameda|praça|praca)\b", cur.lower())
+
+        # se tem via mas não tem cep, tenta juntar com próximas
+        if tem_via and not cep:
+            combo = cur
+            nome = tentar_pegar_nome(linhas[i - 1] if i - 1 >= 0 else "")
+            for j in range(1, 3):
+                if i + j >= len(linhas):
+                    break
+                nx = limpar_texto_endereco(linhas[i + j])
+                if eh_linha_ruim(nx):
+                    continue
+                combo2 = (combo + " " + nx).strip()
+                if linha_parece_endereco(combo2):
+                    enderecos.append((combo2, nome))
+                    i += j + 1
+                    break
+            else:
+                i += 1
+            continue
+
+        # endereço direto
+        if linha_parece_endereco(cur):
+            nome = tentar_pegar_nome(linhas[i - 1] if i - 1 >= 0 else "")
+            enderecos.append((cur, nome))
+            i += 1
+            continue
+
+        i += 1
+
+    return enderecos
+
+def buscar_viacep(cep8):
     cep_num = re.sub(r"\D", "", cep8 or "")
     if len(cep_num) != 8:
         return None
-
-    if cep_num in VIA_CACHE:
-        return VIA_CACHE[cep_num]
-
     url = f"https://viacep.com.br/ws/{cep_num}/json/"
-    try:
-        r = requests.get(url, timeout=18)
-        if r.status_code == 200:
-            j = r.json()
-            if "erro" not in j:
-                VIA_CACHE[cep_num] = j
-                return j
-    except Exception:
+    r = requests.get(url, timeout=TIMEOUT_VIACEP)
+    if r.status_code != 200:
         return None
-    return None
+    j = r.json()
+    if "erro" in j:
+        return None
+    return j
 
-def nominatim_search_json(query: str, bounded=True, limit=1):
+def nominatim_search_json(query, bounded=True, limit=1):
     url = "https://nominatim.openstreetmap.org/search"
     west, south, east, north = MANAUS_VIEWBOX
     params = {
@@ -302,40 +382,29 @@ def nominatim_search_json(query: str, bounded=True, limit=1):
         params["bounded"] = 1
 
     headers = {"User-Agent": USER_AGENT}
+    r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT_NOMINATIM)
+    # respeita Nominatim
+    time.sleep(SLEEP_NOMINATIM)
+
+    if r.status_code != 200:
+        return []
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=22)
+        return r.json() or []
     except Exception:
         return []
-    finally:
-        # respeita o Nominatim
-        time.sleep(SLEEP_NOMINATIM)
 
-    if r.status_code == 200:
-        try:
-            return r.json() or []
-        except Exception:
-            return []
-    return []
-
-def tentar_1_resultado(query: str, bounded=True):
+def tentar_1_resultado(query, bounded=True):
     data = nominatim_search_json(query, bounded=bounded, limit=1)
     if not data:
         return None, None
     try:
-        lat = float(data[0].get("lat"))
-        lon = float(data[0].get("lon"))
+        lat = float(data[0]["lat"])
+        lon = float(data[0]["lon"])
         return lat, lon
     except Exception:
         return None, None
 
-def cache_key(cep_fmt: str, numero: str, logradouro_oficial: str, raw: str) -> str:
-    base = normaliza(logradouro_oficial)
-    if not base:
-        base = normaliza(raw)
-    return f"{cep_fmt}|{str(numero).upper()}|{base}"
-
-def cacar_nome_antigo(raw_original: str, bairro: str, cidade: str, uf: str, cep_fmt: str):
-    # busca top-5 e pega o mais parecido com o texto original
+def cacar_nome_antigo(raw_original, bairro, cidade, uf, cep_fmt):
     consulta = f"{raw_original}, {bairro}, {cidade}-{uf}, {cep_fmt}, {COUNTRY}"
     candidatos = nominatim_search_json(consulta, bounded=True, limit=5)
     if not candidatos:
@@ -365,231 +434,274 @@ def cacar_nome_antigo(raw_original: str, bairro: str, cidade: str, uf: str, cep_
         if score > melhor[2]:
             melhor = (lat, lon, score, display)
 
-    if melhor[0] is not None and melhor[2] >= 0.42:
+    if melhor[0] is not None and melhor[2] >= MIN_SCORE_CACADO:
         return melhor[0], melhor[1], melhor[3], melhor[2]
     return None, None, "", 0.0
 
+def csv_json(obj):
+    return json.dumps(obj, ensure_ascii=False)
 
-# =============================
-# EXTRAÇÃO de endereços do texto bagunçado
-# =============================
-def extrair_enderecos_do_texto(texto: str):
+def montar_linha_destino(logradouro, numero, bairro, cidade, cep_fmt, nome):
     """
-    Heurística:
-    - Divide em linhas
-    - Quando uma linha tem CEP, tenta montar endereço usando:
-      - a própria linha
-      - ou a linha anterior (se ela tem "Rua/Avenida/..." e a linha atual só tem CEP/UF/Cidade)
+    Pra evitar o Circuit mostrar “sem nome”, a gente coloca algo humano no Destination Address.
     """
-    linhas = [l.rstrip() for l in (texto or "").splitlines()]
-    candidatos = []
+    logradouro = (logradouro or "").strip()
+    bairro = (bairro or "").strip()
+    cidade = (cidade or "").strip() or "Manaus"
 
-    for i, linha in enumerate(linhas):
-        l = limpar_texto_endereco(linha)
-        if not l:
-            continue
+    if logradouro:
+        base = f"{logradouro}, {numero}".strip().strip(",")
+        if bairro:
+            base += f" - {bairro}"
+        base += f", {cidade}-AM, {cep_fmt}"
+        return base
 
-        cep = extrair_cep(l)
-        if not cep:
-            continue
+    # fallback forte (CEP)
+    # coloca nome (se tiver) e CEP pra não ficar um “nada”
+    if nome:
+        return f"{nome} - CEP {cep_fmt}, Manaus-AM"
+    return f"CEP {cep_fmt}, Manaus-AM"
 
-        # tenta juntar com a linha anterior se ajudar
-        prev = limpar_texto_endereco(linhas[i - 1]) if i > 0 else ""
-        merged = l
-        if prev and linha_tem_via(prev) and (not linha_tem_via(l)):
-            merged = f"{prev} {l}"
-
-        # filtro mínimo: tem CEP e pelo menos alguma cara de endereço
-        if linha_tem_via(merged) or linha_tem_via(prev):
-            candidatos.append(merged)
-        else:
-            # ainda aceita, mas com cuidado (às vezes vem "Av Brasil 123 Manaus 690xxxxx")
-            candidatos.append(merged)
-
-    # tira duplicados mantendo ordem (mesmo cep+texto)
-    seen = set()
-    out = []
-    for c in candidatos:
-        key = normaliza(c)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(c)
-
-    return out
-
-
-def montar_csv_base64(rows, filename):
-    out = io.StringIO()
-    w = csv.writer(out)
-    w.writerow(["Sequence", "Destination Address", "Bairro", "City", "Zipcode/Postal Code", "Latitude", "Longitude", "Notes"])
-    w.writerows(rows)
-    data = out.getvalue().encode("utf-8")
-    b64 = base64.b64encode(data).decode("ascii")
-    return b64, filename
-
-
-# =============================
+# =========================
 # Rotas
-# =============================
+# =========================
 @app.get("/")
 def home():
     return HTML
 
-
 @app.post("/process_stream")
 def process_stream():
-    payload = request.get_json(silent=True) or {}
-    password = (payload.get("password") or "").strip()
-    text = payload.get("text") or ""
+    data = request.get_json(silent=True) or {}
+    password = (data.get("password") or "").strip()
+    texto = data.get("text") or ""
 
-    if password != APP_PASSWORD:
-        return Response("Senha inválida.", status=401)
+    if APP_PASSWORD and password != APP_PASSWORD:
+        abort(401, "Senha inválida.")
 
-    enderecos = extrair_enderecos_do_texto(text)
-    total = len(enderecos)
+    # Extrai endereços do texto bagunçado
+    pares = extrair_enderecos_do_texto(texto)
+    total = len(pares)
     if total == 0:
-        return Response("Não achei nenhum endereço com CEP no texto. Cola de novo (tem que ter CEP).", status=400)
+        abort(400, "Não achei nenhum endereço com via + CEP. (Tenta colar incluindo CEP na mesma linha.)")
 
     def stream():
         inicio = datetime.now()
 
         ok_rows = []
-        revisar_rows = []
-        cache_hits = 0
-        cache_updates = 0
+        revisar = 0
+        cache_viacep = {}
+        cache_geo = {}  # cache por request (não depende de disco no Render free)
         cacados = 0
 
-        for idx, raw in enumerate(enderecos, start=1):
+        for idx, (raw, nome) in enumerate(pares, start=1):
             percent = (idx / total) * 100.0
-            yield (csv_json({"type": "progress", "percent": percent, "current": idx, "total": total, "msg": raw[:70]}) + "\n")
 
-            raw_limpo = limpar_texto_endereco(raw)
-            cep8 = extrair_cep(raw_limpo)
-            if not cep8:
-                revisar_rows.append([raw_limpo, "SEM_CEP"])
+            # status “batendo”
+            yield (csv_json({
+                "type": "progress",
+                "percent": percent,
+                "current": idx,
+                "total": total,
+                "msg": f"Analisando: {raw[:70]}"
+            }) + "\n")
+
+            raw_clean = limpar_texto_endereco(raw)
+            cep = extrair_cep(raw_clean)
+            if not cep:
+                revisar += 1
                 continue
 
-            dados = buscar_viacep(cep8)
+            cep_fmt = formata_cep(cep)
+            numero = extrair_numero(raw_clean)
+
+            # ViaCEP (cache)
+            yield (csv_json({
+                "type": "progress",
+                "percent": percent,
+                "current": idx,
+                "total": total,
+                "msg": f"ViaCEP: {cep_fmt}"
+            }) + "\n")
+
+            dados = cache_viacep.get(cep)
+            if dados is None:
+                try:
+                    dados = buscar_viacep(cep)
+                except Exception:
+                    dados = None
+                cache_viacep[cep] = dados
+
             if not dados:
-                revisar_rows.append([raw_limpo, f"CEP_INVALIDO ({cep8})"])
-                # sem ViaCEP, fallback só com CEP mesmo
-                cep_fmt = formata_cep(cep8)
-                ok_rows.append([idx, f"{cep_fmt}, Manaus-AM", "", "Manaus", cep_fmt, "", "", f"FALLBACK: CEP_INVALIDO | original: {raw_limpo}"])
+                revisar += 1
+                # fallback mínimo
+                ok_rows.append([
+                    idx,
+                    montar_linha_destino("", numero, "", "Manaus", cep_fmt, nome),
+                    "", "Manaus", cep_fmt, "", "",
+                    f"REVISAO_AUTOMATICA: CEP_INVALIDO | nome={nome or ''} | original: {raw_clean}"
+                ])
                 continue
 
-            cidade_via = (dados.get("localidade") or "").strip().lower()
-            if cidade_via and cidade_via != "manaus":
-                revisar_rows.append([raw_limpo, f"CEP_FORA_MANAUS ({dados.get('localidade','')})"])
-                cep_fmt = formata_cep(cep8)
-                ok_rows.append([idx, f"{cep_fmt}, Manaus-AM", "", "Manaus", cep_fmt, "", "", f"FALLBACK: CEP_FORA_MANAUS | original: {raw_limpo}"])
-                continue
-
-            logradouro = (dados.get("logradouro") or "").strip()
+            cidade = (dados.get("localidade") or "").strip() or "Manaus"
+            uf = (dados.get("uf") or "").strip() or "AM"
             bairro = (dados.get("bairro") or "").strip()
-            cidade = "Manaus"
-            uf = "AM"
-            cep_fmt = formata_cep(cep8)
-            numero = extrair_numero(raw_limpo)
+            logradouro = (dados.get("logradouro") or "").strip()
 
-            # Cache memória
-            k = cache_key(cep_fmt, numero, logradouro, raw_limpo)
-            if k in GEO_CACHE:
-                lat, lon, _ts = GEO_CACHE[k]
-                if dentro_de_manaus(lat, lon):
-                    cache_hits += 1
-                    dest = montar_destino(logradouro, numero, bairro, cidade, uf, cep_fmt, raw_limpo)
-                    ok_rows.append([idx, dest, bairro, cidade, cep_fmt, lat, lon, "CACHE"])
-                    continue
+            # trava Manaus (evita “ponto viajando”)
+            if cidade.strip().lower() != "manaus":
+                revisar += 1
+                ok_rows.append([
+                    idx,
+                    montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
+                    bairro, "Manaus", cep_fmt, "", "",
+                    f"REVISAO_AUTOMATICA: CEP_FORA_MANAUS({cidade}) | nome={nome or ''} | original: {raw_clean}"
+                ])
+                continue
 
-            # Tentativas de geocode
+            # Cache GEO (por request)
+            key = f"{cep_fmt}|{numero}|{normaliza(logradouro) or normaliza(raw_clean)}"
+            if key in cache_geo:
+                lat, lon, note = cache_geo[key]
+                ok_rows.append([idx,
+                               montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
+                               bairro, "Manaus", cep_fmt, lat, lon,
+                               note + (f" | nome={nome}" if nome else "")])
+                continue
+
+            # tentativas Nominatim
             lat = lon = None
             note = ""
 
             queries = []
             if logradouro:
-                queries.append(f"{logradouro}, {numero}, {bairro}, {cidade}-{uf}, {cep_fmt}, {COUNTRY}")
-            queries.append(f"{raw_limpo}, {bairro}, {cidade}-{uf}, {cep_fmt}, {COUNTRY}")
+                queries.append(f"{logradouro}, {numero}, {bairro}, Manaus-{uf}, {cep_fmt}, {COUNTRY}")
+            queries.append(f"{raw_clean}, {bairro}, Manaus-{uf}, {cep_fmt}, {COUNTRY}")
 
-            for q in queries:
-                lat, lon = tentar_1_resultado(q, bounded=True)
+            # bounded + livre (com status dentro do endereço)
+            for qi, q in enumerate(queries, start=1):
+                yield (csv_json({
+                    "type": "progress",
+                    "percent": percent,
+                    "current": idx,
+                    "total": total,
+                    "msg": f"Nominatim bounded (tentativa {qi}/{len(queries)})…"
+                }) + "\n")
+
+                try:
+                    lat, lon = tentar_1_resultado(q, bounded=True)
+                except Exception:
+                    lat = lon = None
+
                 if lat is not None and dentro_de_manaus(lat, lon):
                     break
-                lat2, lon2 = tentar_1_resultado(q, bounded=False)
+
+                yield (csv_json({
+                    "type": "progress",
+                    "percent": percent,
+                    "current": idx,
+                    "total": total,
+                    "msg": f"Nominatim livre (tentativa {qi}/{len(queries)})…"
+                }) + "\n")
+
+                try:
+                    lat2, lon2 = tentar_1_resultado(q, bounded=False)
+                except Exception:
+                    lat2 = lon2 = None
+
                 if lat2 is not None and dentro_de_manaus(lat2, lon2):
                     lat, lon = lat2, lon2
                     break
 
-            # caça “nome antigo” (top-5)
+            # caça nome antigo
             if lat is None or lon is None or (not dentro_de_manaus(lat, lon)):
-                lat3, lon3, display3, score3 = cacar_nome_antigo(raw_limpo, bairro, cidade, uf, cep_fmt)
+                yield (csv_json({
+                    "type": "progress",
+                    "percent": percent,
+                    "current": idx,
+                    "total": total,
+                    "msg": "Caçando nome antigo (top-5)…"
+                }) + "\n")
+
+                try:
+                    lat3, lon3, display3, score3 = cacar_nome_antigo(raw_clean, bairro, "Manaus", uf, cep_fmt)
+                except Exception:
+                    lat3 = lon3 = None
+                    display3 = ""
+                    score3 = 0.0
+
                 if lat3 is not None and dentro_de_manaus(lat3, lon3):
                     lat, lon = lat3, lon3
                     cacados += 1
-                    note = f"CAÇADO(score={score3:.2f}): {display3[:90]}"
+                    note = f"CAÇADO(score={score3:.2f}): {display3[:80]}"
 
-            dest = montar_destino(logradouro, numero, bairro, cidade, uf, cep_fmt, raw_limpo)
-
-            # Fallback inteligente (não fica “CEP pelado”)
+            # fallback CEP
             if lat is None or lon is None:
-                revisar_rows.append([raw_limpo, "NAO_ENCONTRADO"])
-                ok_rows.append([idx, dest, bairro, cidade, cep_fmt, "", "", f"FALLBACK: NAO_ENCONTRADO | original: {raw_limpo}"])
+                revisar += 1
+                ok_rows.append([
+                    idx,
+                    montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
+                    bairro, "Manaus", cep_fmt, "", "",
+                    f"REVISAO_AUTOMATICA: NAO_ENCONTRADO | nome={nome or ''} | original: {raw_clean}"
+                ])
+                cache_geo[key] = ("", "", "FALLBACK_CEP")
                 continue
 
             if not dentro_de_manaus(lat, lon):
-                revisar_rows.append([raw_limpo, f"FORA_MANAUS ({lat},{lon})"])
-                ok_rows.append([idx, dest, bairro, cidade, cep_fmt, "", "", f"FALLBACK: FORA_MANAUS | original: {raw_limpo}"])
+                revisar += 1
+                ok_rows.append([
+                    idx,
+                    montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
+                    bairro, "Manaus", cep_fmt, "", "",
+                    f"REVISAO_AUTOMATICA: FORA_MANAUS({lat},{lon}) | nome={nome or ''} | original: {raw_clean}"
+                ])
                 continue
 
-            ok_rows.append([idx, dest, bairro, cidade, cep_fmt, lat, lon, note])
+            # OK
+            notes = note or "OK"
+            if nome:
+                notes += f" | nome={nome}"
 
-            GEO_CACHE[k] = (lat, lon, datetime.now().isoformat(timespec="seconds"))
-            cache_updates += 1
+            ok_rows.append([
+                idx,
+                montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
+                bairro,
+                "Manaus",
+                cep_fmt,
+                lat,
+                lon,
+                notes
+            ])
 
-        dur = (datetime.now() - inicio).total_seconds()
+            cache_geo[key] = (lat, lon, notes)
+
+        # gera CSV em memória
+        out = io.StringIO()
+        w = csv.writer(out)
+        w.writerow(["Sequence", "Destination Address", "Bairro", "City", "Zipcode/Postal Code", "Latitude", "Longitude", "Notes"])
+        w.writerows(ok_rows)
+        csv_bytes = out.getvalue().encode("utf-8")
+
+        duracao = (datetime.now() - inicio).total_seconds()
         filename = f"circuit_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        b64, _ = montar_csv_base64(ok_rows, filename)
+        b64 = base64.b64encode(csv_bytes).decode("ascii")
 
         yield (csv_json({
             "type": "done",
             "ok": len(ok_rows),
-            "revisar": len(revisar_rows),
-            "seconds": dur,
+            "review": revisar,
+            "seconds": duracao,
             "filename": filename,
-            "csv_base64": b64,
-            "cache_hits": cache_hits,
-            "cache_updates": cache_updates,
-            "cacados": cacados
+            "csv_b64": b64
         }) + "\n")
 
-    return Response(stream(), mimetype="text/plain; charset=utf-8")
+    resp = Response(stream(), mimetype="text/plain; charset=utf-8")
+    # importantíssimo pra não “segurar” stream
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
+    return resp
 
-
-def montar_destino(logradouro, numero, bairro, cidade, uf, cep_fmt, raw_limpo):
-    # Prioriza o “oficial” do ViaCEP, mas não perde informação
-    parts = []
-    if logradouro:
-        parts.append(f"{logradouro}, {numero}".strip().strip(","))
-    else:
-        parts.append(raw_limpo)
-
-    # Bairro ajuda MUITO o Circuit a “puxar pro lugar”
-    if bairro:
-        parts.append(bairro)
-
-    parts.append(f"{cidade}-{uf}")
-    if cep_fmt:
-        parts.append(cep_fmt)
-
-    return ", ".join([p for p in parts if p]).strip()
-
-
-def csv_json(d: dict) -> str:
-    # JSON simples sem depender de lib
-    # (evita import json? mas pode usar json tranquilo. aqui é só pra manter leve)
-    import json
-    return json.dumps(d, ensure_ascii=False)
-
-
+# =========================
+# Run local (Render usa PORT)
+# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
