@@ -25,25 +25,22 @@ app = Flask(__name__)
 # CONFIG
 # =========================
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "1234")
-USER_AGENT = os.environ.get("USER_AGENT", "rota-privada-web/6.0A.1")
+USER_AGENT = os.environ.get("USER_AGENT", "rota-privada-web/6.0A.2")
 
 COUNTRY = "Brazil"
-
-# Mais rápido, mas ainda "educado" com Nominatim (ajuste se precisar)
 SLEEP_NOMINATIM = float(os.environ.get("SLEEP_NOMINATIM", "0.65"))
 
-# Manaus (viewbox aproximado) — segura muito “ponto perdido”
+# Manaus (viewbox aproximado)
 MANAUS_VIEWBOX = (-60.30, -3.25, -59.80, -2.85)  # west, south, east, north
 
-# Timeouts (conexão, leitura) — evita travar infinito
+# Timeouts (conexão, leitura)
 TIMEOUT_VIACEP = (5, 10)
 TIMEOUT_NOMINATIM = (5, 12)
 
-# Score mínimo pra aceitar “caça nome antigo”
 MIN_SCORE_CACADO = float(os.environ.get("MIN_SCORE_CACADO", "0.42"))
 
 # =========================
-# HTML (1 arquivo só)
+# HTML
 # =========================
 HTML = r"""
 <!doctype html>
@@ -51,7 +48,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Roteirizador Privado v6.0A.1</title>
+  <title>Roteirizador Privado v6.0A.2</title>
   <style>
     body{font-family:Arial,Helvetica,sans-serif;background:#fff;color:#111;margin:0}
     .wrap{max-width:900px;margin:40px auto;padding:0 18px}
@@ -75,12 +72,12 @@ HTML = r"""
 </head>
 <body>
   <div class="wrap">
-    <h1>Roteirizador Privado <small style="font-size:12px;border:1px solid #ddd;border-radius:999px;padding:3px 8px;color:#333;">v6.0A.1</small></h1>
+    <h1>Roteirizador Privado <small style="font-size:12px;border:1px solid #ddd;border-radius:999px;padding:3px 8px;color:#333;">v6.0A.2</small></h1>
 
     <div class="card">
       <div class="muted">
-        Cole o texto bagunçado (Shopee/Loggi/Mercado Livre etc). Eu tento achar os endereços e gero um CSV pronto pro Circuit.
-        <br><b>Dica:</b> se tiver CEP + rua na mesma linha, melhor. Mas eu também tento juntar linha quebrada.
+        Cole o texto bagunçado (Shopee/Loggi/Mercado Livre etc). Eu tento achar os endereços e gero um CSV pro Circuit.
+        <br><b>Dica:</b> se tiver CEP + rua na mesma linha, melhor. Se estiver quebrado, eu tento juntar.
       </div>
 
       <div class="row" style="margin-top:10px">
@@ -99,7 +96,7 @@ HTML = r"""
       </div>
 
       <div class="barWrap">
-        <div class="muted" id="hint">Quando começar, vai aparecer barra de progresso e status (sem drama).</div>
+        <div class="muted" id="hint">Quando começar, vai aparecer barra de progresso e status.</div>
         <div class="bar"><div class="fill" id="fill"></div></div>
         <div class="status" id="status"></div>
       </div>
@@ -121,17 +118,25 @@ const hint = document.getElementById("hint");
 function setProgress(p){
   fill.style.width = Math.max(0, Math.min(100, p)) + "%";
 }
-
 function setStatus(msg, cls){
   statusEl.className = "status " + (cls || "");
   statusEl.textContent = msg || "";
 }
 
-function downloadBase64(b64, filename){
-  const byteChars = atob(b64);
-  const byteNums = new Array(byteChars.length);
-  for(let i=0;i<byteChars.length;i++) byteNums[i] = byteChars.charCodeAt(i);
-  const blob = new Blob([new Uint8Array(byteNums)], {type:"text/csv;charset=utf-8"});
+// Base64 URL-safe (robusto)
+function b64UrlToUint8(b64url){
+  // troca URL-safe pra padrão
+  let b64 = (b64url || "").replace(/-/g, "+").replace(/_/g, "/");
+  // padding
+  while (b64.length % 4 !== 0) b64 += "=";
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i=0;i<binary.length;i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function downloadBytes(bytes, filename){
+  const blob = new Blob([bytes], {type:"text/csv;charset=utf-8"});
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -181,12 +186,13 @@ btn.addEventListener("click", async () => {
 
       let idx;
       while((idx = buffer.indexOf("\n")) >= 0){
-        const line = buffer.slice(0, idx).trim();
+        const rawLine = buffer.slice(0, idx);   // NÃO trim aqui
         buffer = buffer.slice(idx+1);
 
-        if(!line) continue;
+        if(!rawLine.trim()) continue;
+
         let msg;
-        try{ msg = JSON.parse(line); }catch(e){ continue; }
+        try{ msg = JSON.parse(rawLine); }catch(e){ continue; }
 
         if(msg.type === "progress"){
           setProgress(msg.percent || 0);
@@ -195,7 +201,14 @@ btn.addEventListener("click", async () => {
         else if(msg.type === "done"){
           setProgress(100);
           setStatus(`Finalizado! OK: ${msg.ok} | Revisar: ${msg.review} | Tempo: ${msg.seconds.toFixed(1)}s`, "ok");
-          downloadBase64(msg.csv_b64, msg.filename);
+
+          try{
+            const bytes = b64UrlToUint8(msg.csv_b64);
+            downloadBytes(bytes, msg.filename);
+          } catch(e){
+            console.error(e);
+            alert("Deu ruim no download (base64). Me manda print que eu ajusto: " + e);
+          }
         }
         else if(msg.type === "error"){
           setStatus("Erro: " + (msg.message || "desconhecido"), "err");
@@ -236,8 +249,7 @@ def similaridade(a, b) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 def extrair_cep(texto):
-    # aceita 69027000 ou 69027-000
-    m = re.search(r"\b(\d{5})-?(\d{3})\b", texto)
+    m = re.search(r"\b(\d{5})-?(\d{3})\b", texto or "")
     if not m:
         return None
     return m.group(1) + m.group(2)
@@ -249,15 +261,12 @@ def formata_cep(cep8):
     return (cep8 or "").strip()
 
 def extrair_numero(texto):
-    # tenta pegar número de porta (bem “brasileiro”: 10, 10A, 437A etc)
-    m = re.search(r"\b(\d{1,6}[A-Za-z]?)\b", texto)
+    m = re.search(r"\b(\d{1,6}[A-Za-z]?)\b", texto or "")
     return m.group(1) if m else "S/N"
 
 def limpar_texto_endereco(texto):
     t = (texto or "").replace("N/A", " ")
-    # remove códigos gigantes (rastreamento etc)
     t = re.sub(r"\b\d{9,}\b", " ", t)
-    # limpa espaços
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -265,7 +274,6 @@ def linha_parece_endereco(texto):
     low = (texto or "").lower()
     via = re.search(r"\b(rua|avenida|av\.|travessa|beco|estrada|alameda|praça|praca)\b", low)
     cep = extrair_cep(texto or "")
-    # precisa de via e cep pra ser “endereço forte”
     return bool(via and cep)
 
 def eh_linha_ruim(l):
@@ -276,38 +284,25 @@ def eh_linha_ruim(l):
     if low.startswith("pacote de"):
         return True
     if re.fullmatch(r"[A-Z0-9_]{8,}", l.replace("-", "").replace(".", "").strip()):
-        # tracking/código
         return True
     if "shpx" in low or "logistica" in low or "ltda" in low:
-        # muito comum em linhas não-endereço
         return True
     return False
 
 def tentar_pegar_nome(linha_anterior):
-    # nome costuma ser linha anterior do endereço
     if not linha_anterior:
         return ""
     s = linha_anterior.strip()
     if eh_linha_ruim(s):
         return ""
-    # se parece endereço, não é nome
     if linha_parece_endereco(s):
         return ""
-    # tira emoticons
     s = s.replace(":^)", "").replace("^)", "").strip()
-    # não deixa nome gigante
     if len(s) > 60:
         s = s[:60].rstrip()
     return s
 
 def extrair_enderecos_do_texto(texto):
-    """
-    Estratégia tradicional (que funciona no mundo real):
-    - quebra por linhas
-    - tenta juntar linha quebrada: se tem "rua/av/trav" mas não tem CEP, cola com próximas 1-2 linhas
-    - aceita endereço quando tem via + CEP
-    - tenta capturar nome na linha anterior
-    """
     linhas = [l.rstrip() for l in (texto or "").splitlines()]
     linhas = [l for l in linhas if l.strip()]
 
@@ -316,7 +311,6 @@ def extrair_enderecos_do_texto(texto):
     while i < len(linhas):
         cur = limpar_texto_endereco(linhas[i])
 
-        # pular lixo
         if eh_linha_ruim(cur):
             i += 1
             continue
@@ -324,10 +318,10 @@ def extrair_enderecos_do_texto(texto):
         cep = extrair_cep(cur)
         tem_via = re.search(r"\b(rua|avenida|av\.|travessa|beco|estrada|alameda|praça|praca)\b", cur.lower())
 
-        # se tem via mas não tem cep, tenta juntar com próximas
         if tem_via and not cep:
             combo = cur
             nome = tentar_pegar_nome(linhas[i - 1] if i - 1 >= 0 else "")
+            achou = False
             for j in range(1, 3):
                 if i + j >= len(linhas):
                     break
@@ -338,12 +332,12 @@ def extrair_enderecos_do_texto(texto):
                 if linha_parece_endereco(combo2):
                     enderecos.append((combo2, nome))
                     i += j + 1
+                    achou = True
                     break
-            else:
+            if not achou:
                 i += 1
             continue
 
-        # endereço direto
         if linha_parece_endereco(cur):
             nome = tentar_pegar_nome(linhas[i - 1] if i - 1 >= 0 else "")
             enderecos.append((cur, nome))
@@ -383,7 +377,6 @@ def nominatim_search_json(query, bounded=True, limit=1):
 
     headers = {"User-Agent": USER_AGENT}
     r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT_NOMINATIM)
-    # respeita Nominatim
     time.sleep(SLEEP_NOMINATIM)
 
     if r.status_code != 200:
@@ -442,9 +435,6 @@ def csv_json(obj):
     return json.dumps(obj, ensure_ascii=False)
 
 def montar_linha_destino(logradouro, numero, bairro, cidade, cep_fmt, nome):
-    """
-    Pra evitar o Circuit mostrar “sem nome”, a gente coloca algo humano no Destination Address.
-    """
     logradouro = (logradouro or "").strip()
     bairro = (bairro or "").strip()
     cidade = (cidade or "").strip() or "Manaus"
@@ -456,8 +446,6 @@ def montar_linha_destino(logradouro, numero, bairro, cidade, cep_fmt, nome):
         base += f", {cidade}-AM, {cep_fmt}"
         return base
 
-    # fallback forte (CEP)
-    # coloca nome (se tiver) e CEP pra não ficar um “nada”
     if nome:
         return f"{nome} - CEP {cep_fmt}, Manaus-AM"
     return f"CEP {cep_fmt}, Manaus-AM"
@@ -478,7 +466,6 @@ def process_stream():
     if APP_PASSWORD and password != APP_PASSWORD:
         abort(401, "Senha inválida.")
 
-    # Extrai endereços do texto bagunçado
     pares = extrair_enderecos_do_texto(texto)
     total = len(pares)
     if total == 0:
@@ -490,13 +477,12 @@ def process_stream():
         ok_rows = []
         revisar = 0
         cache_viacep = {}
-        cache_geo = {}  # cache por request (não depende de disco no Render free)
+        cache_geo = {}
         cacados = 0
 
         for idx, (raw, nome) in enumerate(pares, start=1):
             percent = (idx / total) * 100.0
 
-            # status “batendo”
             yield (csv_json({
                 "type": "progress",
                 "percent": percent,
@@ -514,7 +500,6 @@ def process_stream():
             cep_fmt = formata_cep(cep)
             numero = extrair_numero(raw_clean)
 
-            # ViaCEP (cache)
             yield (csv_json({
                 "type": "progress",
                 "percent": percent,
@@ -533,7 +518,6 @@ def process_stream():
 
             if not dados:
                 revisar += 1
-                # fallback mínimo
                 ok_rows.append([
                     idx,
                     montar_linha_destino("", numero, "", "Manaus", cep_fmt, nome),
@@ -547,7 +531,6 @@ def process_stream():
             bairro = (dados.get("bairro") or "").strip()
             logradouro = (dados.get("logradouro") or "").strip()
 
-            # trava Manaus (evita “ponto viajando”)
             if cidade.strip().lower() != "manaus":
                 revisar += 1
                 ok_rows.append([
@@ -558,7 +541,6 @@ def process_stream():
                 ])
                 continue
 
-            # Cache GEO (por request)
             key = f"{cep_fmt}|{numero}|{normaliza(logradouro) or normaliza(raw_clean)}"
             if key in cache_geo:
                 lat, lon, note = cache_geo[key]
@@ -568,7 +550,6 @@ def process_stream():
                                note + (f" | nome={nome}" if nome else "")])
                 continue
 
-            # tentativas Nominatim
             lat = lon = None
             note = ""
 
@@ -577,7 +558,6 @@ def process_stream():
                 queries.append(f"{logradouro}, {numero}, {bairro}, Manaus-{uf}, {cep_fmt}, {COUNTRY}")
             queries.append(f"{raw_clean}, {bairro}, Manaus-{uf}, {cep_fmt}, {COUNTRY}")
 
-            # bounded + livre (com status dentro do endereço)
             for qi, q in enumerate(queries, start=1):
                 yield (csv_json({
                     "type": "progress",
@@ -612,7 +592,6 @@ def process_stream():
                     lat, lon = lat2, lon2
                     break
 
-            # caça nome antigo
             if lat is None or lon is None or (not dentro_de_manaus(lat, lon)):
                 yield (csv_json({
                     "type": "progress",
@@ -634,7 +613,6 @@ def process_stream():
                     cacados += 1
                     note = f"CAÇADO(score={score3:.2f}): {display3[:80]}"
 
-            # fallback CEP
             if lat is None or lon is None:
                 revisar += 1
                 ok_rows.append([
@@ -656,7 +634,6 @@ def process_stream():
                 ])
                 continue
 
-            # OK
             notes = note or "OK"
             if nome:
                 notes += f" | nome={nome}"
@@ -664,17 +641,13 @@ def process_stream():
             ok_rows.append([
                 idx,
                 montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
-                bairro,
-                "Manaus",
-                cep_fmt,
-                lat,
-                lon,
+                bairro, "Manaus", cep_fmt,
+                lat, lon,
                 notes
             ])
 
             cache_geo[key] = (lat, lon, notes)
 
-        # gera CSV em memória
         out = io.StringIO()
         w = csv.writer(out)
         w.writerow(["Sequence", "Destination Address", "Bairro", "City", "Zipcode/Postal Code", "Latitude", "Longitude", "Notes"])
@@ -683,7 +656,9 @@ def process_stream():
 
         duracao = (datetime.now() - inicio).total_seconds()
         filename = f"circuit_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        b64 = base64.b64encode(csv_bytes).decode("ascii")
+
+        # ✅ Base64 URL-safe (não quebra em proxy) e SEM padding (JS repõe)
+        b64url = base64.urlsafe_b64encode(csv_bytes).decode("ascii").rstrip("=")
 
         yield (csv_json({
             "type": "done",
@@ -691,17 +666,13 @@ def process_stream():
             "review": revisar,
             "seconds": duracao,
             "filename": filename,
-            "csv_b64": b64
+            "csv_b64": b64url
         }) + "\n")
 
     resp = Response(stream(), mimetype="text/plain; charset=utf-8")
-    # importantíssimo pra não “segurar” stream
     resp.headers["Cache-Control"] = "no-cache"
     resp.headers["X-Accel-Buffering"] = "no"
     return resp
 
-# =========================
-# Run local (Render usa PORT)
-# =========================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
