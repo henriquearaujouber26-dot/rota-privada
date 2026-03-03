@@ -5,389 +5,179 @@ import csv
 import time
 import json
 import base64
-import difflib
+import threading
 import requests
 from datetime import datetime
+import difflib
 from flask import Flask, request, Response, abort
 
 # =========================
-# SSL fix (Windows) - não atrapalha no Linux
+# CONFIG (v6.0A.4)
 # =========================
-try:
-    import certifi
-    os.environ["SSL_CERT_FILE"] = certifi.where()
-except Exception:
-    pass
+APP_VERSION = "v6.0A.4"
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "1234")
+
+USER_AGENT = os.environ.get("USER_AGENT", f"rota-privada-web/{APP_VERSION}")
+COUNTRY = "Brazil"
+
+# Hard cap por endereço (o que você pediu)
+MAX_SECONDS_PER_ADDRESS = float(os.environ.get("MAX_SECONDS_PER_ADDRESS", "15"))
+
+# Pausa educada pro Nominatim (tende a reduzir ban / rate limit)
+SLEEP_NOMINATIM = float(os.environ.get("SLEEP_NOMINATIM", "0.65"))
+
+# Viewbox aproximada Manaus (pra evitar pular pra outro bairro/estado)
+MANAUS_VIEWBOX = (-60.30, -3.25, -59.80, -2.85)  # (west, south, east, north)
+
+# Cache só em memória (Render free NÃO tem disk persistente)
+CACHE_MAX = int(os.environ.get("CACHE_MAX", "5000"))  # limite simples
+
 
 app = Flask(__name__)
 
-# =========================
-# CONFIG
-# =========================
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "1234")
-USER_AGENT = os.environ.get("USER_AGENT", "rota-privada-web/6.0A.3")
+# cache em memória: key -> (lat, lon)
+_cache = {}
+_cache_lock = threading.Lock()
 
-COUNTRY = "Brazil"
-
-# Respeitoso, mas mais rápido
-SLEEP_NOMINATIM = float(os.environ.get("SLEEP_NOMINATIM", "0.55"))
-
-# Manaus (viewbox aproximado)
-MANAUS_VIEWBOX = (-60.30, -3.25, -59.80, -2.85)  # west, south, east, north
-
-# Timeouts (conexão, leitura) - mais agressivo pra não "parecer travado"
-TIMEOUT_VIACEP = (5, 10)
-TIMEOUT_NOMINATIM = (5, 9)
-
-MIN_SCORE_CACADO = float(os.environ.get("MIN_SCORE_CACADO", "0.42"))
 
 # =========================
-# HTML
-# =========================
-HTML = r"""
-<!doctype html>
-<html lang="pt-br">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Roteirizador Privado v6.0A.3</title>
-  <style>
-    body{font-family:Arial,Helvetica,sans-serif;background:#fff;color:#111;margin:0}
-    .wrap{max-width:900px;margin:40px auto;padding:0 18px}
-    h1{font-size:26px;margin:0 0 14px 0}
-    .card{border:1px solid #ddd;border-radius:10px;padding:16px}
-    label{font-weight:700}
-    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-    input[type=password]{padding:10px;border:1px solid #ccc;border-radius:8px;min-width:240px}
-    button{padding:10px 14px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}
-    button:disabled{opacity:.55;cursor:not-allowed}
-    textarea{width:100%;min-height:320px;margin-top:8px;border:1px solid #ccc;border-radius:10px;padding:12px;font-family:ui-monospace,Consolas,monospace;font-size:12px}
-    .muted{color:#666;font-size:12px;margin-top:8px}
-    .barWrap{margin-top:10px}
-    .bar{height:14px;border-radius:999px;background:#eee;overflow:hidden}
-    .fill{height:100%;width:0;background:#111;transition:width .12s linear}
-    .status{font-family:ui-monospace,Consolas,monospace;font-size:12px;margin-top:6px;color:#333}
-    .ok{color:#0a7}
-    .warn{color:#c70}
-    .err{color:#c00}
-    .tiny{font-size:11px;color:#666;margin-top:4px;font-family:ui-monospace,Consolas,monospace}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>Roteirizador Privado <small style="font-size:12px;border:1px solid #ddd;border-radius:999px;padding:3px 8px;color:#333;">v6.0A.3</small></h1>
-
-    <div class="card">
-      <div class="muted">
-        Cole o texto bagunçado (Shopee/Loggi/Mercado Livre etc). Eu tento achar os endereços e gero um CSV pro Circuit.
-        <br><b>Dica:</b> se tiver CEP + rua na mesma linha, melhor. Se estiver quebrado, eu tento juntar.
-      </div>
-
-      <div class="row" style="margin-top:10px">
-        <div>
-          <label>Senha:</label><br/>
-          <input id="pwd" type="password" placeholder="APP_PASSWORD" />
-        </div>
-        <div style="padding-top:18px">
-          <button id="btn">Gerar CSV</button>
-        </div>
-      </div>
-
-      <div>
-        <label style="display:block;margin-top:12px">Cole aqui:</label>
-        <textarea id="txt" placeholder="Cole aqui sua lista bagunçada..."></textarea>
-      </div>
-
-      <div class="barWrap">
-        <div class="muted" id="hint">Quando começar, vai aparecer barra de progresso e status.</div>
-        <div class="bar"><div class="fill" id="fill"></div></div>
-        <div class="status" id="status"></div>
-        <div class="tiny" id="alive"></div>
-      </div>
-
-      <div class="muted">
-        Saída: <b>circuit_import_*.csv</b> (download automático). Se cair em fallback, vai em <b>Notes</b> com motivo.
-      </div>
-    </div>
-  </div>
-
-<script>
-const btn = document.getElementById("btn");
-const txt = document.getElementById("txt");
-const pwd = document.getElementById("pwd");
-const fill = document.getElementById("fill");
-const statusEl = document.getElementById("status");
-const hint = document.getElementById("hint");
-const aliveEl = document.getElementById("alive");
-
-let lastMsgAt = 0;
-let aliveTimer = null;
-
-function setProgress(p){
-  fill.style.width = Math.max(0, Math.min(100, p)) + "%";
-}
-function setStatus(msg, cls){
-  statusEl.className = "status " + (cls || "");
-  statusEl.textContent = msg || "";
-}
-
-function startAlive(){
-  lastMsgAt = Date.now();
-  if(aliveTimer) clearInterval(aliveTimer);
-  aliveTimer = setInterval(() => {
-    const s = Math.floor((Date.now() - lastMsgAt)/1000);
-    if(s <= 1){
-      aliveEl.textContent = "";
-      return;
-    }
-    aliveEl.textContent = `Sem atualização há ${s}s (normal quando o geocoder está respondendo).`;
-  }, 500);
-}
-function bumpAlive(){
-  lastMsgAt = Date.now();
-}
-
-function b64UrlToUint8(b64url){
-  let b64 = (b64url || "").replace(/-/g, "+").replace(/_/g, "/");
-  while (b64.length % 4 !== 0) b64 += "=";
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i=0;i<binary.length;i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
-function downloadBytes(bytes, filename){
-  const blob = new Blob([bytes], {type:"text/csv;charset=utf-8"});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename || "circuit_import.csv";
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-btn.addEventListener("click", async () => {
-  const payload = txt.value || "";
-  const pass = pwd.value || "";
-
-  if(!payload.trim()){
-    alert("Cole o texto primeiro :)");
-    return;
-  }
-
-  btn.disabled = true;
-  hint.textContent = "Processando... não fecha a página.";
-  setProgress(0);
-  setStatus("Iniciando...", "warn");
-  startAlive();
-
-  try{
-    const resp = await fetch("/process_stream", {
-      method: "POST",
-      headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({password: pass, text: payload})
-    });
-
-    if(!resp.ok){
-      const t = await resp.text();
-      alert("Erro: " + t);
-      btn.disabled = false;
-      if(aliveTimer) clearInterval(aliveTimer);
-      return;
-    }
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buffer = "";
-
-    while(true){
-      const {value, done} = await reader.read();
-      if(done) break;
-
-      bumpAlive();
-      buffer += decoder.decode(value, {stream:true});
-
-      let idx;
-      while((idx = buffer.indexOf("\n")) >= 0){
-        const rawLine = buffer.slice(0, idx); // não trim
-        buffer = buffer.slice(idx+1);
-
-        if(!rawLine.trim()) continue;
-
-        let msg;
-        try{ msg = JSON.parse(rawLine); }catch(e){ continue; }
-
-        if(msg.type === "progress"){
-          setProgress(msg.percent || 0);
-          setStatus(`${(msg.percent||0).toFixed(1)}%  (${msg.current}/${msg.total})  ${msg.msg||""}`, "warn");
-        }
-        else if(msg.type === "done"){
-          setProgress(100);
-          setStatus(`Finalizado! OK: ${msg.ok} | Revisar: ${msg.review} | Tempo: ${msg.seconds.toFixed(1)}s`, "ok");
-          if(aliveTimer) clearInterval(aliveTimer);
-          aliveEl.textContent = "";
-
-          const bytes = b64UrlToUint8(msg.csv_b64);
-          downloadBytes(bytes, msg.filename);
-        }
-        else if(msg.type === "error"){
-          setStatus("Erro: " + (msg.message || "desconhecido"), "err");
-          if(aliveTimer) clearInterval(aliveTimer);
-          aliveEl.textContent = "";
-          alert("Erro: " + (msg.message || "desconhecido"));
-        }
-      }
-    }
-  } catch(e){
-    console.error(e);
-    if(aliveTimer) clearInterval(aliveTimer);
-    aliveEl.textContent = "";
-    alert("Falhou: " + e);
-  } finally{
-    btn.disabled = false;
-  }
-});
-</script>
-</body>
-</html>
-"""
-
-# =========================
-# Helpers
+# HELPERS
 # =========================
 def dentro_de_manaus(lat, lon):
     west, south, east, north = MANAUS_VIEWBOX
     return (west <= lon <= east) and (south <= lat <= north)
 
-def normaliza(s: str) -> str:
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+def normaliza(s):
     s = (s or "").lower().strip()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-def similaridade(a, b) -> float:
+def similaridade(a, b):
     a = normaliza(a)
     b = normaliza(b)
     if not a or not b:
         return 0.0
     return difflib.SequenceMatcher(None, a, b).ratio()
 
-def extrair_cep(texto):
-    m = re.search(r"\b(\d{5})-?(\d{3})\b", texto or "")
-    if not m:
-        return None
-    return m.group(1) + m.group(2)
+def formata_cep(cep):
+    c = re.sub(r"\D", "", cep or "")
+    return f"{c[:5]}-{c[5:]}" if len(c) == 8 else (cep or "")
 
-def formata_cep(cep8):
-    c = re.sub(r"\D", "", cep8 or "")
-    if len(c) == 8:
-        return f"{c[:5]}-{c[5:]}"
-    return (cep8 or "").strip()
+def extrair_cep(texto):
+    m = re.search(r"\b\d{8}\b", texto or "")
+    return m.group() if m else None
 
 def extrair_numero(texto):
-    m = re.search(r"\b(\d{1,6}[A-Za-z]?)\b", texto or "")
+    # pega o primeiro número "provável" (evita telefone)
+    # ex: "Rua X, 115 ..." -> 115
+    # se tiver "Apto 203" não atrapalha: ainda pega 115
+    t = texto or ""
+    # remove telefones grandes
+    t = re.sub(r"\b\d{9,}\b", " ", t)
+    m = re.search(r"\b(\d{1,5}[A-Za-z]?)\b", t)
     return m.group(1) if m else "S/N"
 
 def limpar_texto_endereco(texto):
     t = (texto or "").replace("N/A", " ")
+    # remove telefones (9+ dígitos)
     t = re.sub(r"\b\d{9,}\b", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
 def linha_parece_endereco(texto):
-    low = (texto or "").lower()
-    via = re.search(r"\b(rua|avenida|av\.|travessa|beco|estrada|alameda|praça|praca)\b", low)
-    cep = extrair_cep(texto or "")
+    if not texto:
+        return False
+    via = re.search(r"\b(rua|avenida|av\.|travessa|beco|estrada|alameda|praça|lote|conjunto)\b", texto.lower())
+    cep = re.search(r"\b\d{8}\b", texto)
     return bool(via and cep)
 
-def eh_linha_ruim(l):
-    l = (l or "").strip()
-    if not l:
-        return True
-    low = l.lower()
-    if low.startswith("pacote de"):
-        return True
-    if re.fullmatch(r"[A-Z0-9_]{8,}", l.replace("-", "").replace(".", "").strip()):
-        return True
-    if "shpx" in low or "logistica" in low or "ltda" in low:
-        return True
-    return False
-
-def tentar_pegar_nome(linha_anterior):
-    if not linha_anterior:
-        return ""
-    s = linha_anterior.strip()
-    if eh_linha_ruim(s):
-        return ""
-    if linha_parece_endereco(s):
-        return ""
-    s = s.replace(":^)", "").replace("^)", "").strip()
-    if len(s) > 60:
-        s = s[:60].rstrip()
-    return s
-
-def extrair_enderecos_do_texto(texto):
-    linhas = [l.rstrip() for l in (texto or "").splitlines()]
-    linhas = [l for l in linhas if l.strip()]
-
-    enderecos = []
-    i = 0
-    while i < len(linhas):
-        cur = limpar_texto_endereco(linhas[i])
-
-        if eh_linha_ruim(cur):
-            i += 1
+def juntar_linhas_quebradas(linhas):
+    """
+    Junta linha quebrada (nome numa linha, endereço na outra, etc).
+    Estratégia simples e eficiente:
+      - se a linha atual não tem CEP, segura como buffer
+      - quando aparecer uma linha com CEP, cola buffer + linha
+    """
+    out = []
+    buf = ""
+    for ln in linhas:
+        ln = limpar_texto_endereco(ln)
+        if not ln:
             continue
+        if extrair_cep(ln):
+            if buf:
+                out.append(limpar_texto_endereco(buf + " " + ln))
+                buf = ""
+            else:
+                out.append(ln)
+        else:
+            # acumula possíveis pedaços
+            if len(ln) <= 120:  # evita colar textos enormes tipo "Pacote de..."
+                buf = (buf + " " + ln).strip() if buf else ln
+            else:
+                # joga fora lixo muito grande
+                buf = buf
+    return out
 
-        cep = extrair_cep(cur)
-        tem_via = re.search(r"\b(rua|avenida|av\.|travessa|beco|estrada|alameda|praça|praca)\b", cur.lower())
+def extrair_enderecos_do_texto(texto_bruto):
+    linhas = (texto_bruto or "").splitlines()
+    linhas = [l.rstrip() for l in linhas if l.strip()]
+    # 1) tenta pegar direto linhas que parecem endereço
+    diretas = [limpar_texto_endereco(l) for l in linhas if linha_parece_endereco(l)]
+    # 2) junta quebradas e tenta novamente
+    juntas = juntar_linhas_quebradas(linhas)
+    juntas = [l for l in juntas if linha_parece_endereco(l)]
+    # mistura mantendo ordem (sem duplicar)
+    seen = set()
+    out = []
+    for l in diretas + juntas:
+        k = normaliza(l)
+        if k and k not in seen:
+            seen.add(k)
+            out.append(l)
+    return out
 
-        if tem_via and not cep:
-            combo = cur
-            nome = tentar_pegar_nome(linhas[i - 1] if i - 1 >= 0 else "")
-            achou = False
-            for j in range(1, 3):
-                if i + j >= len(linhas):
-                    break
-                nx = limpar_texto_endereco(linhas[i + j])
-                if eh_linha_ruim(nx):
-                    continue
-                combo2 = (combo + " " + nx).strip()
-                if linha_parece_endereco(combo2):
-                    enderecos.append((combo2, nome))
-                    i += j + 1
-                    achou = True
-                    break
-            if not achou:
-                i += 1
-            continue
+def cache_key(cep_fmt, numero, logradouro_oficial, raw):
+    base = normaliza(logradouro_oficial)
+    if not base:
+        base = normaliza(re.sub(r"\b\d{8}\b", "", raw or ""))
+    return f"{cep_fmt}|{str(numero).upper()}|{base}"
 
-        if linha_parece_endereco(cur):
-            nome = tentar_pegar_nome(linhas[i - 1] if i - 1 >= 0 else "")
-            enderecos.append((cur, nome))
-            i += 1
-            continue
+def cache_get(k):
+    with _cache_lock:
+        return _cache.get(k)
 
-        i += 1
+def cache_set(k, lat, lon):
+    with _cache_lock:
+        # limite simples (FIFO tosco): se estourar, limpa geral
+        if len(_cache) >= CACHE_MAX:
+            _cache.clear()
+        _cache[k] = (lat, lon)
 
-    return enderecos
+def req_get(url, *, params=None, headers=None, timeout=10):
+    # timeout pode ser float ou (connect, read)
+    return requests.get(url, params=params, headers=headers, timeout=timeout)
 
-def buscar_viacep(cep8):
-    cep_num = re.sub(r"\D", "", cep8 or "")
+def buscar_viacep(cep, timeout_s):
+    cep_num = re.sub(r"\D", "", cep or "")
     if len(cep_num) != 8:
         return None
     url = f"https://viacep.com.br/ws/{cep_num}/json/"
-    r = requests.get(url, timeout=TIMEOUT_VIACEP)
-    if r.status_code != 200:
+    try:
+        r = req_get(url, timeout=min(max(2.0, timeout_s), 12.0))
+        if r.status_code == 200:
+            j = r.json()
+            if "erro" not in j:
+                return j
+    except Exception:
         return None
-    j = r.json()
-    if "erro" in j:
-        return None
-    return j
+    return None
 
-def nominatim_search_json(query, bounded=True, limit=1):
+def nominatim_search_json(query, *, bounded=True, limit=1, timeout_s=10):
     url = "https://nominatim.openstreetmap.org/search"
     west, south, east, north = MANAUS_VIEWBOX
     params = {
@@ -402,46 +192,41 @@ def nominatim_search_json(query, bounded=True, limit=1):
         params["bounded"] = 1
 
     headers = {"User-Agent": USER_AGENT}
-    r = requests.get(url, params=params, headers=headers, timeout=TIMEOUT_NOMINATIM)
-    time.sleep(SLEEP_NOMINATIM)
-
-    if r.status_code != 200:
-        return []
     try:
-        return r.json() or []
+        r = req_get(url, params=params, headers=headers, timeout=min(max(2.5, timeout_s), 25.0))
+        # dorme só se ainda faz sentido (pra não estourar o hardcap)
+        if SLEEP_NOMINATIM > 0:
+            time.sleep(SLEEP_NOMINATIM)
+        if r.status_code == 200:
+            try:
+                return r.json() or []
+            except Exception:
+                return []
     except Exception:
         return []
+    return []
 
-def tentar_1_resultado(query, bounded=True):
-    data = nominatim_search_json(query, bounded=bounded, limit=1)
+def tentar_1_resultado(query, *, bounded=True, timeout_s=8):
+    data = nominatim_search_json(query, bounded=bounded, limit=1, timeout_s=timeout_s)
     if not data:
-        return None, None
+        return None, None, ""
     try:
         lat = float(data[0]["lat"])
         lon = float(data[0]["lon"])
-        return lat, lon
+        disp = data[0].get("display_name", "") or ""
+        return lat, lon, disp
     except Exception:
-        return None, None
+        return None, None, ""
 
-def tentar_com_retry(query, bounded=True, tries=2):
-    # retry curto pra não "parar o mundo"
-    last = (None, None)
-    for t in range(1, tries + 1):
-        try:
-            lat, lon = tentar_1_resultado(query, bounded=bounded)
-            if lat is not None:
-                return lat, lon
-            last = (lat, lon)
-        except Exception:
-            last = (None, None)
-        time.sleep(0.25 * t)
-    return last
-
-def cacar_nome_antigo(raw_original, bairro, cidade, uf, cep_fmt):
+def caca_nome_antigo(raw_original, bairro, cidade, uf, cep_fmt, timeout_s):
+    """
+    Pega top-5 e escolhe melhor por similaridade.
+    Só roda se ainda tiver tempo sobrando dentro do hardcap.
+    """
     consulta = f"{raw_original}, {bairro}, {cidade}-{uf}, {cep_fmt}, {COUNTRY}"
-    candidatos = nominatim_search_json(consulta, bounded=True, limit=5)
+    candidatos = nominatim_search_json(consulta, bounded=True, limit=5, timeout_s=timeout_s)
     if not candidatos:
-        candidatos = nominatim_search_json(consulta, bounded=False, limit=5)
+        candidatos = nominatim_search_json(consulta, bounded=False, limit=5, timeout_s=timeout_s)
 
     melhor = (None, None, 0.0, "")
     for c in candidatos:
@@ -467,255 +252,502 @@ def cacar_nome_antigo(raw_original, bairro, cidade, uf, cep_fmt):
         if score > melhor[2]:
             melhor = (lat, lon, score, display)
 
-    if melhor[0] is not None and melhor[2] >= MIN_SCORE_CACADO:
+    if melhor[0] is not None and melhor[2] >= 0.42:
         return melhor[0], melhor[1], melhor[3], melhor[2]
     return None, None, "", 0.0
 
-def csv_json(obj):
-    return json.dumps(obj, ensure_ascii=False)
+def montar_fallback_viacep(dados_viacep, numero, cep_fmt):
+    """
+    Fallback bonito: não fica só "CEP seco".
+    Se ViaCEP tiver logradouro/bairro, monta uma linha melhor.
+    """
+    logradouro = (dados_viacep.get("logradouro") or "").strip()
+    bairro = (dados_viacep.get("bairro") or "").strip()
 
-def montar_linha_destino(logradouro, numero, bairro, cidade, cep_fmt, nome):
-    logradouro = (logradouro or "").strip()
-    bairro = (bairro or "").strip()
-    cidade = (cidade or "").strip() or "Manaus"
-
+    partes = []
     if logradouro:
-        base = f"{logradouro}, {numero}".strip().strip(",")
-        if bairro:
-            base += f" - {bairro}"
-        base += f", {cidade}-AM, {cep_fmt}"
-        return base
+        if numero and numero != "S/N":
+            partes.append(f"{logradouro}, {numero}")
+        else:
+            partes.append(logradouro)
+    if bairro:
+        partes.append(bairro)
 
-    if nome:
-        return f"{nome} - CEP {cep_fmt}, Manaus-AM"
-    return f"CEP {cep_fmt}, Manaus-AM"
+    # sempre inclui o CEP
+    partes.append(f"{cep_fmt}")
+    partes.append("Manaus-AM")
+
+    # Ex: "Rua X, 115, Compensa, 69035-000, Manaus-AM"
+    return ", ".join([p for p in partes if p])
+
+def sse_event(obj):
+    # SSE: data: {json}\n\n
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+def processar_1_endereco(seq, raw, send_progress):
+    """
+    Retorna:
+      (ok_row, revisar_row, stats)
+    ok_row no formato do Circuit:
+      [Sequence, Destination Address, Bairro, City, Zipcode/Postal Code, Latitude, Longitude, Notes]
+    revisar_row:
+      [endereco_original, motivo]
+    """
+    t0 = time.monotonic()
+    deadline = t0 + MAX_SECONDS_PER_ADDRESS
+
+    def remaining():
+        return max(0.0, deadline - time.monotonic())
+
+    cep = extrair_cep(raw)
+    numero = extrair_numero(raw)
+
+    if not cep:
+        return None, [raw, "SEM_CEP"], {"fallback": False, "cacado": False, "cache": False}
+
+    # 1) ViaCEP (rápido)
+    send_progress(stage="ViaCEP")
+    dados = buscar_viacep(cep, timeout_s=min(remaining(), 6.0))
+    if not dados:
+        # sem viacep, fallback CEP seco
+        cep_fmt = formata_cep(cep)
+        ok = [
+            seq,
+            f"{cep_fmt}, Manaus-AM",
+            "",
+            "Manaus",
+            cep_fmt,
+            "",
+            "",
+            f"FALLBACK: CEP_INVALIDO/VIACEP_FAIL | original: {raw}",
+        ]
+        return ok, [raw, f"CEP_INVALIDO ({cep})"], {"fallback": True, "cacado": False, "cache": False}
+
+    if str(dados.get("localidade", "")).strip().lower() != "manaus":
+        cep_fmt = formata_cep(cep)
+        ok = [
+            seq,
+            f"{cep_fmt}, Manaus-AM",
+            (dados.get("bairro") or "").strip(),
+            "Manaus",
+            cep_fmt,
+            "",
+            "",
+            f"FALLBACK: CEP_FORA_MANAUS({dados.get('localidade','')}) | original: {raw}",
+        ]
+        return ok, [raw, f"CEP_FORA_MANAUS ({dados.get('localidade','')})"], {"fallback": True, "cacado": False, "cache": False}
+
+    logradouro = (dados.get("logradouro") or "").strip()
+    bairro = (dados.get("bairro") or "").strip()
+    cidade = "Manaus"
+    uf = "AM"
+    cep_fmt = formata_cep(cep)
+
+    # 2) Cache
+    k = cache_key(cep_fmt, numero, logradouro, raw)
+    cached = cache_get(k)
+    if cached:
+        lat, lon = cached
+        if dentro_de_manaus(lat, lon):
+            ok = [
+                seq,
+                (f"{logradouro}, {numero}".strip(", ") if logradouro else montar_fallback_viacep(dados, numero, cep_fmt)),
+                bairro,
+                cidade,
+                cep_fmt,
+                lat,
+                lon,
+                "CACHE",
+            ]
+            return ok, None, {"fallback": False, "cacado": False, "cache": True}
+
+    # Se já passou o tempo (pode acontecer em pico), corta
+    if remaining() <= 0.2:
+        fallback_addr = montar_fallback_viacep(dados, numero, cep_fmt)
+        ok = [
+            seq, fallback_addr, bairro, cidade, cep_fmt, "", "", f"FALLBACK: TIMEOUT({MAX_SECONDS_PER_ADDRESS}s) | original: {raw}"
+        ]
+        return ok, [raw, "TIMEOUT_HARDCAP"], {"fallback": True, "cacado": False, "cache": False}
+
+    # 3) Tentativas Nominatim: bounded -> unbounded
+    lat = lon = None
+    note = ""
+    cacado = False
+
+    queries = []
+    if logradouro:
+        queries.append(f"{logradouro}, {numero}, {bairro}, {cidade}-{uf}, {cep_fmt}, {COUNTRY}")
+    queries.append(f"{raw}, {bairro}, {cidade}-{uf}, {cep_fmt}, {COUNTRY}")
+
+    for idx, q in enumerate(queries, start=1):
+        if remaining() <= 0.2:
+            break
+
+        # bounded
+        send_progress(stage=f"Nominatim bounded (tentativa {idx}/2)")
+        lat1, lon1, _disp1 = tentar_1_resultado(q, bounded=True, timeout_s=min(remaining(), 7.5))
+        if lat1 is not None and dentro_de_manaus(lat1, lon1):
+            lat, lon = lat1, lon1
+            break
+
+        if remaining() <= 0.2:
+            break
+
+        # unbounded
+        send_progress(stage=f"Nominatim livre (tentativa {idx}/2)")
+        lat2, lon2, _disp2 = tentar_1_resultado(q, bounded=False, timeout_s=min(remaining(), 7.5))
+        if lat2 is not None and dentro_de_manaus(lat2, lon2):
+            lat, lon = lat2, lon2
+            break
+
+    # 4) Caça nome antigo (top-5) se ainda tiver tempo decente
+    if (lat is None or lon is None or not dentro_de_manaus(lat, lon)) and remaining() >= 3.0:
+        send_progress(stage="Caçando nome antigo (top-5)…")
+        lat3, lon3, disp3, score3 = caca_nome_antigo(raw, bairro, cidade, uf, cep_fmt, timeout_s=min(remaining(), 10.0))
+        if lat3 is not None and dentro_de_manaus(lat3, lon3):
+            lat, lon = lat3, lon3
+            cacado = True
+            note = f"CAÇADO(score={score3:.2f}): {disp3[:80]}"
+
+    # 5) Se falhou ou fora da caixa, fallback ViaCEP (bonito)
+    if lat is None or lon is None or not dentro_de_manaus(lat, lon):
+        motivo = "NAO_ENCONTRADO" if (lat is None or lon is None) else f"FORA_MANAUS({lat},{lon})"
+        fallback_addr = montar_fallback_viacep(dados, numero, cep_fmt)
+        ok = [
+            seq,
+            fallback_addr,
+            bairro,
+            cidade,
+            cep_fmt,
+            "",
+            "",
+            f"FALLBACK: {motivo} | original: {raw}",
+        ]
+        return ok, [raw, motivo], {"fallback": True, "cacado": False, "cache": False}
+
+    # 6) OK normal
+    destino = (f"{logradouro}, {numero}".strip(", ") if logradouro else montar_fallback_viacep(dados, numero, cep_fmt))
+    ok = [
+        seq,
+        destino,
+        bairro,
+        cidade,
+        cep_fmt,
+        lat,
+        lon,
+        note
+    ]
+
+    cache_set(k, lat, lon)
+    return ok, None, {"fallback": False, "cacado": cacado, "cache": False}
+
 
 # =========================
-# Rotas
+# HTML (interface)
+# =========================
+HTML = f"""<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Roteirizador Privado {APP_VERSION}</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; background:#fff; margin:0; padding:0; }}
+    .wrap {{ max-width: 980px; margin: 40px auto; padding: 0 16px; }}
+    h1 {{ text-align:center; margin:0 0 10px; }}
+    .ver {{ font-size: 12px; padding: 2px 8px; border:1px solid #ddd; border-radius: 999px; vertical-align: middle; }}
+    .card {{ border:1px solid #e6e6e6; border-radius: 12px; padding: 18px; }}
+    textarea {{ width:100%; min-height: 300px; padding: 12px; border-radius: 10px; border:1px solid #ddd; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }}
+    input[type="password"] {{ padding:10px; border:1px solid #ddd; border-radius:10px; width: 240px; }}
+    button {{ padding:10px 16px; border:0; border-radius: 10px; cursor:pointer; background:#111; color:#fff; font-weight:600; }}
+    button:disabled {{ opacity:.5; cursor:not-allowed; }}
+    .row {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
+    .hint {{ color:#444; font-size: 13px; margin: 0 0 10px; }}
+    .small {{ color:#666; font-size: 12px; margin-top:10px; }}
+    .progress-wrap {{ margin-top: 12px; }}
+    .bar {{ width:100%; height: 12px; border-radius: 999px; background:#eee; overflow:hidden; }}
+    .fill {{ height: 12px; width:0%; background:#111; transition: width .15s linear; }}
+    .status {{ margin-top: 8px; font-size: 13px; color:#111; }}
+    .bad {{ color:#b00020; font-weight: 600; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Roteirizador Privado <span class="ver">{APP_VERSION}</span></h1>
+    <div class="card">
+      <p class="hint">
+        Cole o texto bagunçado (Shopee/Loggi/Mercado Livre etc). Eu extraio endereços e gero um CSV pronto pro Circuit.<br/>
+        <b>Dica raiz:</b> se a linha tiver <b>rua + número + CEP</b>, é sucesso. Se cair em fallback, vai em <b>Notes</b> com motivo.
+        <br/><b>Hard cap:</b> no máximo <b>{MAX_SECONDS_PER_ADDRESS:.0f}s</b> por endereço.
+      </p>
+
+      <div class="row">
+        <label><b>Senha:</b></label>
+        <input id="senha" type="password" placeholder="APP_PASSWORD"/>
+        <button id="btn">Gerar CSV</button>
+      </div>
+
+      <div style="margin-top:12px;">
+        <label><b>Cole aqui:</b></label>
+        <textarea id="txt" placeholder="Cole aqui sua lista bagunçada..."></textarea>
+      </div>
+
+      <div class="progress-wrap" id="pw" style="display:none;">
+        <div class="bar"><div class="fill" id="fill"></div></div>
+        <div class="status" id="status">Processando...</div>
+      </div>
+
+      <div class="small">
+        Saída: <b>circuit_import_*.csv</b> (download automático).
+      </div>
+    </div>
+  </div>
+
+<script>
+const btn = document.getElementById("btn");
+const txt = document.getElementById("txt");
+const senha = document.getElementById("senha");
+const pw = document.getElementById("pw");
+const fill = document.getElementById("fill");
+const statusEl = document.getElementById("status");
+
+function setProgress(pct, msg) {{
+  pw.style.display = "block";
+  fill.style.width = Math.max(0, Math.min(100, pct)).toFixed(1) + "%";
+  statusEl.textContent = msg || "";
+}}
+
+function downloadBase64Csv(b64, filename) {{
+  // Base64 -> bytes
+  const binary = atob(b64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i=0; i<len; i++) bytes[i] = binary.charCodeAt(i);
+
+  const blob = new Blob([bytes], {{type: "text/csv;charset=utf-8"}});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename || "circuit_import.csv";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}}
+
+btn.addEventListener("click", async () => {{
+  const payload = {{
+    senha: senha.value || "",
+    texto: txt.value || ""
+  }};
+
+  if (!payload.texto.trim()) {{
+    alert("Cole algum texto primeiro 🙂");
+    return;
+  }}
+
+  btn.disabled = true;
+  setProgress(0, "Iniciando... não fecha a página.");
+
+  try {{
+    const res = await fetch("/process", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify(payload)
+    }});
+
+    if (!res.ok) {{
+      const t = await res.text();
+      throw new Error(t || ("HTTP " + res.status));
+    }}
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {{
+      const {{ value, done }} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {{ stream: true }});
+
+      // SSE events separated by double newline
+      let idx;
+      while ((idx = buffer.indexOf("\\n\\n")) >= 0) {{
+        const chunk = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+
+        // read "data: ..."
+        const lines = chunk.split("\\n");
+        for (const line of lines) {{
+          if (!line.startsWith("data: ")) continue;
+          const jsonStr = line.slice(6);
+          if (!jsonStr) continue;
+          const ev = JSON.parse(jsonStr);
+
+          if (ev.type === "progress") {{
+            setProgress(ev.percent || 0, ev.message || "Processando...");
+          }} else if (ev.type === "done") {{
+            setProgress(100, "Finalizado. Baixando CSV...");
+            downloadBase64Csv(ev.csv_base64, ev.filename);
+          }} else if (ev.type === "error") {{
+            statusEl.innerHTML = '<span class="bad">Deu ruim: ' + (ev.message || "erro") + '</span>';
+          }} else if (ev.type === "ping") {{
+            // só keepalive
+          }}
+        }}
+      }}
+    }}
+  }} catch (e) {{
+    console.error(e);
+    alert("Erro: " + (e.message || e));
+  }} finally {{
+    btn.disabled = false;
+  }}
+}});
+</script>
+</body>
+</html>
+"""
+
+
+# =========================
+# ROUTES
 # =========================
 @app.get("/")
 def home():
     return HTML
 
-@app.post("/process_stream")
-def process_stream():
+@app.post("/process")
+def process():
     data = request.get_json(silent=True) or {}
-    password = (data.get("password") or "").strip()
-    texto = data.get("text") or ""
+    senha = (data.get("senha") or "").strip()
+    texto = data.get("texto") or ""
 
-    if APP_PASSWORD and password != APP_PASSWORD:
+    if senha != APP_PASSWORD:
         abort(401, "Senha inválida.")
 
-    pares = extrair_enderecos_do_texto(texto)
-    total = len(pares)
+    enderecos = extrair_enderecos_do_texto(texto)
+    total = len(enderecos)
     if total == 0:
-        abort(400, "Não achei nenhum endereço com via + CEP. (Tenta colar incluindo CEP na mesma linha.)")
+        abort(400, "Não achei endereços. Dica: precisa ter RUA/AV/TRAVESSA/Beco + CEP (8 dígitos).")
 
     def stream():
-        inicio = datetime.now()
-
         ok_rows = []
-        revisar = 0
-        cache_viacep = {}
-        cache_geo = {}
-        cacados = 0
+        revisar_rows = []
+        inicio = time.monotonic()
 
-        for idx, (raw, nome) in enumerate(pares, start=1):
-            percent = (idx / total) * 100.0
+        cache_hits = 0
+        cacos = 0
+        fallbacks = 0
 
-            yield (csv_json({
-                "type": "progress",
-                "percent": percent,
-                "current": idx,
-                "total": total,
-                "msg": f"Analisando: {raw[:70]}"
-            }) + "\n")
+        # header SSE
+        yield "retry: 1500\n\n"
 
-            raw_clean = limpar_texto_endereco(raw)
-            cep = extrair_cep(raw_clean)
-            if not cep:
-                revisar += 1
-                continue
+        # ping inicial
+        yield sse_event({"type":"ping","ts":now_iso()})
 
-            cep_fmt = formata_cep(cep)
-            numero = extrair_numero(raw_clean)
+        last_ping = time.monotonic()
 
-            yield (csv_json({
-                "type": "progress",
-                "percent": percent,
-                "current": idx,
-                "total": total,
-                "msg": f"ViaCEP: {cep_fmt}"
-            }) + "\n")
+        for i, raw in enumerate(enderecos, start=1):
+            percent = (i / total) * 100.0
+            base_msg = f"{percent:.1f}% ({i}/{total})"
 
-            dados = cache_viacep.get(cep)
-            if dados is None:
+            def send_progress(stage=""):
+                msg = f"{base_msg} {stage}".strip()
+                yield sse_event({"type":"progress","percent":percent,"message":msg})
+
+            # manda uma atualização logo no começo do endereço
+            yield sse_event({"type":"progress","percent":percent,"message":f"{base_msg} Iniciando… {raw[:70]}"})
+
+            # keepalive ping (evita “travou” por idle)
+            if time.monotonic() - last_ping >= 2.5:
+                yield sse_event({"type":"ping","ts":now_iso()})
+                last_ping = time.monotonic()
+
+            # processa endereço (com hardcap interno)
+            # pra poder mandar progresso por stage, passamos um "sender"
+            # que vai yieldar eventos durante o processamento
+            stage_msgs = []
+
+            def stage_sender(stage):
+                stage_msgs.append(stage)
+
+            try:
+                ok, rev, stats = processar_1_endereco(i, raw, send_progress=lambda stage="": stage_sender(stage))
+                # despeja os stages coletados (mantém UI viva)
+                for st in stage_msgs:
+                    yield sse_event({"type":"progress","percent":percent,"message":f"{base_msg} {st}"})
+
+                if stats.get("cache"):
+                    cache_hits += 1
+                if stats.get("cacado"):
+                    cacos += 1
+                if stats.get("fallback"):
+                    fallbacks += 1
+
+                if ok:
+                    ok_rows.append(ok)
+                if rev:
+                    revisar_rows.append(rev)
+
+            except Exception as e:
+                # erro inesperado: não mata tudo, só joga em revisão + fallback
                 try:
-                    dados = buscar_viacep(cep)
+                    cep = extrair_cep(raw) or ""
+                    cep_fmt = formata_cep(cep) if cep else ""
+                    ok_rows.append([
+                        i,
+                        (f"{cep_fmt}, Manaus-AM" if cep_fmt else "Manaus-AM"),
+                        "",
+                        "Manaus",
+                        cep_fmt,
+                        "",
+                        "",
+                        f"FALLBACK: EXCEPTION({str(e)[:80]}) | original: {raw}",
+                    ])
                 except Exception:
-                    dados = None
-                cache_viacep[cep] = dados
+                    pass
+                revisar_rows.append([raw, f"EXCEPTION: {str(e)[:120]}"])
 
-            if not dados:
-                revisar += 1
-                ok_rows.append([
-                    idx,
-                    montar_linha_destino("", numero, "", "Manaus", cep_fmt, nome),
-                    "", "Manaus", cep_fmt, "", "",
-                    f"REVISAO_AUTOMATICA: CEP_INVALIDO | nome={nome or ''} | original: {raw_clean}"
-                ])
-                continue
+            # ping extra
+            if time.monotonic() - last_ping >= 2.5:
+                yield sse_event({"type":"ping","ts":now_iso()})
+                last_ping = time.monotonic()
 
-            cidade = (dados.get("localidade") or "").strip() or "Manaus"
-            uf = (dados.get("uf") or "").strip() or "AM"
-            bairro = (dados.get("bairro") or "").strip()
-            logradouro = (dados.get("logradouro") or "").strip()
-
-            if cidade.strip().lower() != "manaus":
-                revisar += 1
-                ok_rows.append([
-                    idx,
-                    montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
-                    bairro, "Manaus", cep_fmt, "", "",
-                    f"REVISAO_AUTOMATICA: CEP_FORA_MANAUS({cidade}) | nome={nome or ''} | original: {raw_clean}"
-                ])
-                continue
-
-            key = f"{cep_fmt}|{numero}|{normaliza(logradouro) or normaliza(raw_clean)}"
-            if key in cache_geo:
-                lat, lon, note = cache_geo[key]
-                ok_rows.append([
-                    idx,
-                    montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
-                    bairro, "Manaus", cep_fmt, lat, lon,
-                    note + (f" | nome={nome}" if nome else "")
-                ])
-                continue
-
-            lat = lon = None
-            note = ""
-
-            # Estratégia: bounded primeiro (Manaus), depois livre só se necessário
-            queries = []
-            if logradouro:
-                queries.append(f"{logradouro}, {numero}, {bairro}, Manaus-{uf}, {cep_fmt}, {COUNTRY}")
-            queries.append(f"{raw_clean}, {bairro}, Manaus-{uf}, {cep_fmt}, {COUNTRY}")
-
-            # 1) bounded com retry curtinho
-            for qi, q in enumerate(queries, start=1):
-                yield (csv_json({
-                    "type": "progress",
-                    "percent": percent,
-                    "current": idx,
-                    "total": total,
-                    "msg": f"Nominatim bounded (tentativa {qi}/{len(queries)})…"
-                }) + "\n")
-
-                lat, lon = tentar_com_retry(q, bounded=True, tries=2)
-                if lat is not None and dentro_de_manaus(lat, lon):
-                    break
-                lat = lon = None
-
-            # 2) livre só se ainda falhou (também com retry)
-            if lat is None or lon is None:
-                for qi, q in enumerate(queries, start=1):
-                    yield (csv_json({
-                        "type": "progress",
-                        "percent": percent,
-                        "current": idx,
-                        "total": total,
-                        "msg": f"Nominatim livre (tentativa {qi}/{len(queries)})…"
-                    }) + "\n")
-
-                    lat2, lon2 = tentar_com_retry(q, bounded=False, tries=2)
-                    if lat2 is not None and dentro_de_manaus(lat2, lon2):
-                        lat, lon = lat2, lon2
-                        break
-
-            # 3) caça nome antigo (top-5)
-            if lat is None or lon is None:
-                yield (csv_json({
-                    "type": "progress",
-                    "percent": percent,
-                    "current": idx,
-                    "total": total,
-                    "msg": "Caçando nome antigo (top-5)…"
-                }) + "\n")
-
-                try:
-                    lat3, lon3, display3, score3 = cacar_nome_antigo(raw_clean, bairro, "Manaus", uf, cep_fmt)
-                except Exception:
-                    lat3 = lon3 = None
-                    display3 = ""
-                    score3 = 0.0
-
-                if lat3 is not None and dentro_de_manaus(lat3, lon3):
-                    lat, lon = lat3, lon3
-                    cacados += 1
-                    note = f"CAÇADO(score={score3:.2f}): {display3[:80]}"
-
-            # 4) fallback (mas com endereço útil, não só CEP seco)
-            if lat is None or lon is None:
-                revisar += 1
-                ok_rows.append([
-                    idx,
-                    montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
-                    bairro, "Manaus", cep_fmt, "", "",
-                    f"REVISAO_AUTOMATICA: NAO_ENCONTRADO | nome={nome or ''} | original: {raw_clean}"
-                ])
-                cache_geo[key] = ("", "", "FALLBACK")
-                continue
-
-            if not dentro_de_manaus(lat, lon):
-                revisar += 1
-                ok_rows.append([
-                    idx,
-                    montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
-                    bairro, "Manaus", cep_fmt, "", "",
-                    f"REVISAO_AUTOMATICA: FORA_MANAUS({lat},{lon}) | nome={nome or ''} | original: {raw_clean}"
-                ])
-                continue
-
-            notes = note or "OK"
-            if nome:
-                notes += f" | nome={nome}"
-
-            ok_rows.append([
-                idx,
-                montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
-                bairro, "Manaus", cep_fmt,
-                lat, lon,
-                notes
-            ])
-
-            cache_geo[key] = (lat, lon, notes)
-
+        # monta CSV em memória
         out = io.StringIO()
         w = csv.writer(out)
         w.writerow(["Sequence", "Destination Address", "Bairro", "City", "Zipcode/Postal Code", "Latitude", "Longitude", "Notes"])
         w.writerows(ok_rows)
         csv_bytes = out.getvalue().encode("utf-8")
 
-        duracao = (datetime.now() - inicio).total_seconds()
+        # base64 limpo (sem newline)
+        b64 = base64.b64encode(csv_bytes).decode("ascii")
+
+        dur = time.monotonic() - inicio
         filename = f"circuit_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
-        # Base64 URL-safe e sem padding
-        b64url = base64.urlsafe_b64encode(csv_bytes).decode("ascii").rstrip("=")
-
-        yield (csv_json({
+        # evento final
+        yield sse_event({
             "type": "done",
-            "ok": len(ok_rows),
-            "review": revisar,
-            "seconds": duracao,
             "filename": filename,
-            "csv_b64": b64url,
-            "cacados": cacados
-        }) + "\n")
+            "csv_base64": b64,
+            "stats": {
+                "total": total,
+                "ok": len(ok_rows),
+                "revisar": len(revisar_rows),
+                "cache_hits": cache_hits,
+                "cacados": cacos,
+                "fallbacks": fallbacks,
+                "tempo_s": round(dur, 1),
+                "hardcap_s": MAX_SECONDS_PER_ADDRESS
+            }
+        })
 
-    resp = Response(stream(), mimetype="text/plain; charset=utf-8")
-    resp.headers["Cache-Control"] = "no-cache"
-    resp.headers["X-Accel-Buffering"] = "no"
-    return resp
+    return Response(stream(), mimetype="text/event-stream")
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # Render usa PORT no ambiente
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
