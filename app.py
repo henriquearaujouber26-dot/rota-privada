@@ -25,17 +25,19 @@ app = Flask(__name__)
 # CONFIG
 # =========================
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "1234")
-USER_AGENT = os.environ.get("USER_AGENT", "rota-privada-web/6.0A.2")
+USER_AGENT = os.environ.get("USER_AGENT", "rota-privada-web/6.0A.3")
 
 COUNTRY = "Brazil"
-SLEEP_NOMINATIM = float(os.environ.get("SLEEP_NOMINATIM", "0.65"))
+
+# Respeitoso, mas mais rápido
+SLEEP_NOMINATIM = float(os.environ.get("SLEEP_NOMINATIM", "0.55"))
 
 # Manaus (viewbox aproximado)
 MANAUS_VIEWBOX = (-60.30, -3.25, -59.80, -2.85)  # west, south, east, north
 
-# Timeouts (conexão, leitura)
+# Timeouts (conexão, leitura) - mais agressivo pra não "parecer travado"
 TIMEOUT_VIACEP = (5, 10)
-TIMEOUT_NOMINATIM = (5, 12)
+TIMEOUT_NOMINATIM = (5, 9)
 
 MIN_SCORE_CACADO = float(os.environ.get("MIN_SCORE_CACADO", "0.42"))
 
@@ -48,7 +50,7 @@ HTML = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Roteirizador Privado v6.0A.2</title>
+  <title>Roteirizador Privado v6.0A.3</title>
   <style>
     body{font-family:Arial,Helvetica,sans-serif;background:#fff;color:#111;margin:0}
     .wrap{max-width:900px;margin:40px auto;padding:0 18px}
@@ -68,11 +70,12 @@ HTML = r"""
     .ok{color:#0a7}
     .warn{color:#c70}
     .err{color:#c00}
+    .tiny{font-size:11px;color:#666;margin-top:4px;font-family:ui-monospace,Consolas,monospace}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Roteirizador Privado <small style="font-size:12px;border:1px solid #ddd;border-radius:999px;padding:3px 8px;color:#333;">v6.0A.2</small></h1>
+    <h1>Roteirizador Privado <small style="font-size:12px;border:1px solid #ddd;border-radius:999px;padding:3px 8px;color:#333;">v6.0A.3</small></h1>
 
     <div class="card">
       <div class="muted">
@@ -99,6 +102,7 @@ HTML = r"""
         <div class="muted" id="hint">Quando começar, vai aparecer barra de progresso e status.</div>
         <div class="bar"><div class="fill" id="fill"></div></div>
         <div class="status" id="status"></div>
+        <div class="tiny" id="alive"></div>
       </div>
 
       <div class="muted">
@@ -114,6 +118,10 @@ const pwd = document.getElementById("pwd");
 const fill = document.getElementById("fill");
 const statusEl = document.getElementById("status");
 const hint = document.getElementById("hint");
+const aliveEl = document.getElementById("alive");
+
+let lastMsgAt = 0;
+let aliveTimer = null;
 
 function setProgress(p){
   fill.style.width = Math.max(0, Math.min(100, p)) + "%";
@@ -123,11 +131,24 @@ function setStatus(msg, cls){
   statusEl.textContent = msg || "";
 }
 
-// Base64 URL-safe (robusto)
+function startAlive(){
+  lastMsgAt = Date.now();
+  if(aliveTimer) clearInterval(aliveTimer);
+  aliveTimer = setInterval(() => {
+    const s = Math.floor((Date.now() - lastMsgAt)/1000);
+    if(s <= 1){
+      aliveEl.textContent = "";
+      return;
+    }
+    aliveEl.textContent = `Sem atualização há ${s}s (normal quando o geocoder está respondendo).`;
+  }, 500);
+}
+function bumpAlive(){
+  lastMsgAt = Date.now();
+}
+
 function b64UrlToUint8(b64url){
-  // troca URL-safe pra padrão
   let b64 = (b64url || "").replace(/-/g, "+").replace(/_/g, "/");
-  // padding
   while (b64.length % 4 !== 0) b64 += "=";
   const binary = atob(b64);
   const bytes = new Uint8Array(binary.length);
@@ -160,6 +181,7 @@ btn.addEventListener("click", async () => {
   hint.textContent = "Processando... não fecha a página.";
   setProgress(0);
   setStatus("Iniciando...", "warn");
+  startAlive();
 
   try{
     const resp = await fetch("/process_stream", {
@@ -172,6 +194,7 @@ btn.addEventListener("click", async () => {
       const t = await resp.text();
       alert("Erro: " + t);
       btn.disabled = false;
+      if(aliveTimer) clearInterval(aliveTimer);
       return;
     }
 
@@ -182,11 +205,13 @@ btn.addEventListener("click", async () => {
     while(true){
       const {value, done} = await reader.read();
       if(done) break;
+
+      bumpAlive();
       buffer += decoder.decode(value, {stream:true});
 
       let idx;
       while((idx = buffer.indexOf("\n")) >= 0){
-        const rawLine = buffer.slice(0, idx);   // NÃO trim aqui
+        const rawLine = buffer.slice(0, idx); // não trim
         buffer = buffer.slice(idx+1);
 
         if(!rawLine.trim()) continue;
@@ -201,23 +226,24 @@ btn.addEventListener("click", async () => {
         else if(msg.type === "done"){
           setProgress(100);
           setStatus(`Finalizado! OK: ${msg.ok} | Revisar: ${msg.review} | Tempo: ${msg.seconds.toFixed(1)}s`, "ok");
+          if(aliveTimer) clearInterval(aliveTimer);
+          aliveEl.textContent = "";
 
-          try{
-            const bytes = b64UrlToUint8(msg.csv_b64);
-            downloadBytes(bytes, msg.filename);
-          } catch(e){
-            console.error(e);
-            alert("Deu ruim no download (base64). Me manda print que eu ajusto: " + e);
-          }
+          const bytes = b64UrlToUint8(msg.csv_b64);
+          downloadBytes(bytes, msg.filename);
         }
         else if(msg.type === "error"){
           setStatus("Erro: " + (msg.message || "desconhecido"), "err");
+          if(aliveTimer) clearInterval(aliveTimer);
+          aliveEl.textContent = "";
           alert("Erro: " + (msg.message || "desconhecido"));
         }
       }
     }
   } catch(e){
     console.error(e);
+    if(aliveTimer) clearInterval(aliveTimer);
+    aliveEl.textContent = "";
     alert("Falhou: " + e);
   } finally{
     btn.disabled = false;
@@ -397,6 +423,20 @@ def tentar_1_resultado(query, bounded=True):
     except Exception:
         return None, None
 
+def tentar_com_retry(query, bounded=True, tries=2):
+    # retry curto pra não "parar o mundo"
+    last = (None, None)
+    for t in range(1, tries + 1):
+        try:
+            lat, lon = tentar_1_resultado(query, bounded=bounded)
+            if lat is not None:
+                return lat, lon
+            last = (lat, lon)
+        except Exception:
+            last = (None, None)
+        time.sleep(0.25 * t)
+    return last
+
 def cacar_nome_antigo(raw_original, bairro, cidade, uf, cep_fmt):
     consulta = f"{raw_original}, {bairro}, {cidade}-{uf}, {cep_fmt}, {COUNTRY}"
     candidatos = nominatim_search_json(consulta, bounded=True, limit=5)
@@ -544,20 +584,24 @@ def process_stream():
             key = f"{cep_fmt}|{numero}|{normaliza(logradouro) or normaliza(raw_clean)}"
             if key in cache_geo:
                 lat, lon, note = cache_geo[key]
-                ok_rows.append([idx,
-                               montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
-                               bairro, "Manaus", cep_fmt, lat, lon,
-                               note + (f" | nome={nome}" if nome else "")])
+                ok_rows.append([
+                    idx,
+                    montar_linha_destino(logradouro, numero, bairro, "Manaus", cep_fmt, nome),
+                    bairro, "Manaus", cep_fmt, lat, lon,
+                    note + (f" | nome={nome}" if nome else "")
+                ])
                 continue
 
             lat = lon = None
             note = ""
 
+            # Estratégia: bounded primeiro (Manaus), depois livre só se necessário
             queries = []
             if logradouro:
                 queries.append(f"{logradouro}, {numero}, {bairro}, Manaus-{uf}, {cep_fmt}, {COUNTRY}")
             queries.append(f"{raw_clean}, {bairro}, Manaus-{uf}, {cep_fmt}, {COUNTRY}")
 
+            # 1) bounded com retry curtinho
             for qi, q in enumerate(queries, start=1):
                 yield (csv_json({
                     "type": "progress",
@@ -567,32 +611,29 @@ def process_stream():
                     "msg": f"Nominatim bounded (tentativa {qi}/{len(queries)})…"
                 }) + "\n")
 
-                try:
-                    lat, lon = tentar_1_resultado(q, bounded=True)
-                except Exception:
-                    lat = lon = None
-
+                lat, lon = tentar_com_retry(q, bounded=True, tries=2)
                 if lat is not None and dentro_de_manaus(lat, lon):
                     break
+                lat = lon = None
 
-                yield (csv_json({
-                    "type": "progress",
-                    "percent": percent,
-                    "current": idx,
-                    "total": total,
-                    "msg": f"Nominatim livre (tentativa {qi}/{len(queries)})…"
-                }) + "\n")
+            # 2) livre só se ainda falhou (também com retry)
+            if lat is None or lon is None:
+                for qi, q in enumerate(queries, start=1):
+                    yield (csv_json({
+                        "type": "progress",
+                        "percent": percent,
+                        "current": idx,
+                        "total": total,
+                        "msg": f"Nominatim livre (tentativa {qi}/{len(queries)})…"
+                    }) + "\n")
 
-                try:
-                    lat2, lon2 = tentar_1_resultado(q, bounded=False)
-                except Exception:
-                    lat2 = lon2 = None
+                    lat2, lon2 = tentar_com_retry(q, bounded=False, tries=2)
+                    if lat2 is not None and dentro_de_manaus(lat2, lon2):
+                        lat, lon = lat2, lon2
+                        break
 
-                if lat2 is not None and dentro_de_manaus(lat2, lon2):
-                    lat, lon = lat2, lon2
-                    break
-
-            if lat is None or lon is None or (not dentro_de_manaus(lat, lon)):
+            # 3) caça nome antigo (top-5)
+            if lat is None or lon is None:
                 yield (csv_json({
                     "type": "progress",
                     "percent": percent,
@@ -613,6 +654,7 @@ def process_stream():
                     cacados += 1
                     note = f"CAÇADO(score={score3:.2f}): {display3[:80]}"
 
+            # 4) fallback (mas com endereço útil, não só CEP seco)
             if lat is None or lon is None:
                 revisar += 1
                 ok_rows.append([
@@ -621,7 +663,7 @@ def process_stream():
                     bairro, "Manaus", cep_fmt, "", "",
                     f"REVISAO_AUTOMATICA: NAO_ENCONTRADO | nome={nome or ''} | original: {raw_clean}"
                 ])
-                cache_geo[key] = ("", "", "FALLBACK_CEP")
+                cache_geo[key] = ("", "", "FALLBACK")
                 continue
 
             if not dentro_de_manaus(lat, lon):
@@ -657,7 +699,7 @@ def process_stream():
         duracao = (datetime.now() - inicio).total_seconds()
         filename = f"circuit_import_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
-        # ✅ Base64 URL-safe (não quebra em proxy) e SEM padding (JS repõe)
+        # Base64 URL-safe e sem padding
         b64url = base64.urlsafe_b64encode(csv_bytes).decode("ascii").rstrip("=")
 
         yield (csv_json({
@@ -666,7 +708,8 @@ def process_stream():
             "review": revisar,
             "seconds": duracao,
             "filename": filename,
-            "csv_b64": b64url
+            "csv_b64": b64url,
+            "cacados": cacados
         }) + "\n")
 
     resp = Response(stream(), mimetype="text/plain; charset=utf-8")
