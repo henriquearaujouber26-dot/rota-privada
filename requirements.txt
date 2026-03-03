@@ -1,4 +1,2 @@
-flask
-requests
-gunicorn
-certifi
+flask==3.0.3
+requests==2.32.3
