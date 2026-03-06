@@ -14,7 +14,7 @@ app = Flask(__name__)
 # =========================
 # CONFIG
 # =========================
-APP_VERSION = "6.1.2-site"
+APP_VERSION = "6.1.3-site"
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "1234")
 USER_AGENT = os.environ.get("USER_AGENT", f"rota-privada-web/{APP_VERSION}")
 COUNTRY = "Brazil"
@@ -145,6 +145,14 @@ def force_rua_if_rio(raw: str) -> str:
         return "Rua " + raw
     return raw
 
+def similaridade(a: str, b: str) -> float:
+    import difflib
+    a = normaliza(a)
+    b = normaliza(b)
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
 # =========================
 # CACHE
 # =========================
@@ -267,23 +275,19 @@ def bairro_bate(bairro_esperado, item):
     b = normaliza(bairro_esperado)
     if not b:
         return True
-    b_res = normaliza(pega_bairro_do_resultado(item)) or normaliza(item.get("display_name", ""))
+
+    bairro_resultado = pega_bairro_do_resultado(item)
+    b_res = normaliza(bairro_resultado) or normaliza(item.get("display_name", ""))
+
     if b in b_res:
         return True
     if "mestri" in b and "mestri" in b_res:
         return True
+    if similaridade(bairro_esperado, bairro_resultado) >= 0.62:
+        return True
     return False
 
 def escolher_melhor_candidato(candidatos, rua_raw, bairro_esperado):
-    import difflib
-
-    def sim(a, b):
-        a = normaliza(a)
-        b = normaliza(b)
-        if not a or not b:
-            return 0.0
-        return difflib.SequenceMatcher(None, a, b).ratio()
-
     melhor = (None, None, -1.0, None)
     for c in candidatos:
         try:
@@ -300,7 +304,7 @@ def escolher_melhor_candidato(candidatos, rua_raw, bairro_esperado):
             continue
 
         display = c.get("display_name", "") or ""
-        score = sim(rua_raw, display)
+        score = similaridade(rua_raw, display)
 
         cls = (c.get("class") or "").lower()
         typ = (c.get("type") or "").lower()
@@ -317,7 +321,7 @@ def escolher_melhor_candidato(candidatos, rua_raw, bairro_esperado):
     return None, None, 0.0, None
 
 # =========================
-# PARSER ROBUSTO
+# PARSER ROBUSTO (CEP COMO ÂNCORA)
 # =========================
 def extrair_cep_any(texto: str):
     if not texto:
@@ -383,82 +387,60 @@ def parse_entregas(texto_colado: str):
     linhas = [l for l in linhas if l.strip()]
 
     entregas = []
-    i = 0
 
-    while i < len(linhas):
-        l0 = linhas[i].strip()
-        l1 = linhas[i + 1].strip() if i + 1 < len(linhas) else ""
-        l2 = linhas[i + 2].strip() if i + 2 < len(linhas) else ""
-        l3 = linhas[i + 3].strip() if i + 3 < len(linhas) else ""
+    for i, linha in enumerate(linhas):
+        cep = extrair_cep_any(linha)
+        if not cep:
+            continue
 
-        # MODELO 1: nome / endereço / cep
-        if is_linha_nome(l0) and linha_tem_via(l1):
-            cep = extrair_cep_any(l2) or extrair_cep_any(l1)
-            if cep:
-                entregas.append({
-                    "nome": l0,
-                    "endereco_raw": strip_cep_text(l1),
-                    "bairro_raw": extrair_bairro_de_endereco(l1),
-                    "cep8": cep
-                })
-                i += 3
-                continue
+        nome = ""
+        endereco = ""
+        bairro = ""
 
-        # MODELO 2: endereço / cep
-        if linha_tem_via(l0):
-            cep = extrair_cep_any(l0) or extrair_cep_any(l1)
-            if cep:
-                entregas.append({
-                    "nome": "",
-                    "endereco_raw": strip_cep_text(l0),
-                    "bairro_raw": extrair_bairro_de_endereco(l0),
-                    "cep8": cep
-                })
-                i += 2
-                continue
+        anteriores = []
+        for j in range(max(0, i - 3), i):
+            if linhas[j].strip():
+                anteriores.append(linhas[j].strip())
 
-        # MODELO 3: nome / rua / bairro / cep
-        if is_linha_nome(l0) and l1 and l2 and l3:
-            cep = extrair_cep_any(l3)
-            if cep and (linha_tem_via(l1) or re.search(r",\s*\d", l1) or re.search(r"\d{1,6}", l1)):
-                endereco = f"{l1} - {l2} - MANAUS/AM"
-                entregas.append({
-                    "nome": l0,
-                    "endereco_raw": strip_cep_text(endereco),
-                    "bairro_raw": l2,
-                    "cep8": cep
-                })
-                i += 4
-                continue
+        # tenta endereço na linha mais próxima do CEP
+        for cand in reversed(anteriores):
+            if linha_tem_via(cand) or re.search(r",\s*\d", cand) or re.search(r"\d{1,6}", cand):
+                endereco = cand
+                break
 
-        # MODELO 4: rua / bairro / cep
-        if l0 and l1 and l2:
-            cep = extrair_cep_any(l2)
-            if cep and (linha_tem_via(l0) or re.search(r",\s*\d", l0) or re.search(r"\d{1,6}", l0)):
-                endereco = f"{l0} - {l1} - MANAUS/AM"
-                entregas.append({
-                    "nome": "",
-                    "endereco_raw": strip_cep_text(endereco),
-                    "bairro_raw": l1,
-                    "cep8": cep
-                })
-                i += 3
-                continue
+        # se não achou endereço, tenta usar a própria linha do CEP
+        if not endereco and linha_tem_via(linha):
+            endereco = strip_cep_text(linha)
 
-        # MODELO 5: nome / endereço com CEP na mesma linha
-        if is_linha_nome(l0) and linha_tem_via(l1):
-            cep = extrair_cep_any(l1)
-            if cep:
-                entregas.append({
-                    "nome": l0,
-                    "endereco_raw": strip_cep_text(l1),
-                    "bairro_raw": extrair_bairro_de_endereco(l1),
-                    "cep8": cep
-                })
-                i += 2
-                continue
+        # tenta bairro separado
+        if anteriores:
+            for cand in reversed(anteriores):
+                if cand != endereco and not is_linha_nome(cand) and not extrair_cep_any(cand):
+                    if len(cand.split()) <= 5 and not linha_tem_via(cand):
+                        bairro = cand
+                        break
 
-        i += 1
+        # tenta nome
+        for cand in anteriores:
+            if cand != endereco and cand != bairro and is_linha_nome(cand):
+                nome = cand
+                break
+
+        # tenta bairro a partir do endereço
+        if not bairro and endereco:
+            bairro = extrair_bairro_de_endereco(endereco)
+
+        # se tem endereço e bairro separado, monta bloco mais forte
+        if endereco and bairro and "manaus" not in endereco.lower():
+            endereco = f"{endereco} - {bairro} - MANAUS/AM"
+
+        if endereco:
+            entregas.append({
+                "nome": nome,
+                "endereco_raw": strip_cep_text(endereco),
+                "bairro_raw": bairro,
+                "cep8": cep
+            })
 
     entregas = [e for e in entregas if len(only_digits(e.get("cep8", ""))) == 8]
     return entregas
