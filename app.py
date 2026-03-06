@@ -2,41 +2,13 @@ import os
 import io
 import re
 import csv
-import time
-from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
-
-import requests
 from flask import Flask, request, send_file, render_template_string, abort
 
 app = Flask(__name__)
 
-# =========================
-# CONFIG
-# =========================
-APP_VERSION = "6.1.1"
+APP_VERSION = "6.1.1-min"
 APP_PASSWORD = os.environ.get("APP_PASSWORD", "1234")
-USER_AGENT = os.environ.get("USER_AGENT", f"rota-privada-web/{APP_VERSION}")
-COUNTRY = "Brazil"
 
-SLEEP_NOMINATIM = float(os.environ.get("SLEEP_NOMINATIM", "0.65"))
-MAX_SECONDS_PER_ADDRESS = float(os.environ.get("MAX_SECONDS_PER_ADDRESS", "15"))
-MAX_TOTAL_ADDRESSES = int(os.environ.get("MAX_TOTAL_ADDRESSES", "500"))
-
-# trava opcional
-BAIRRO_FIXO = os.environ.get("BAIRRO_FIXO", "").strip()
-
-MANAUS_VIEWBOX = (-60.30, -3.25, -59.80, -2.85)
-
-GEOCODE_CACHE_FILE = "geocode_cache.csv"
-VIACEP_CACHE_FILE = "viacep_cache.csv"
-
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": USER_AGENT})
-
-# =========================
-# HTML
-# =========================
 HTML = f"""
 <!doctype html>
 <html lang="pt-br">
@@ -45,517 +17,141 @@ HTML = f"""
   <title>Roteirizador Privado v{APP_VERSION}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <style>
-    body{{font-family:Arial,sans-serif;background:#fff;margin:0;padding:0}}
-    .wrap{{max-width:950px;margin:38px auto;padding:0 16px}}
-    h1{{text-align:center;margin:0 0 18px}}
-    .badge{{font-size:12px;background:#eee;border-radius:999px;padding:3px 8px;vertical-align:middle}}
-    .card{{border:1px solid #ddd;border-radius:12px;padding:18px;box-shadow:0 2px 10px rgba(0,0,0,.03)}}
-    .hint{{font-size:13px;color:#444;line-height:1.5}}
-    .row{{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px}}
-    input[type=password]{{padding:10px;border:1px solid #ccc;border-radius:10px;width:260px}}
-    button{{padding:10px 16px;border:0;border-radius:10px;background:#111;color:#fff;font-weight:bold;cursor:pointer}}
-    button:disabled{{opacity:.5;cursor:not-allowed}}
-    textarea{{width:100%;min-height:360px;margin-top:12px;border:1px solid #ccc;border-radius:10px;padding:12px;font:13px Consolas,monospace;resize:vertical}}
-    .small{{font-size:12px;color:#666;margin-top:8px}}
+    body {{ font-family: Arial, sans-serif; background:#fff; margin:0; padding:0; }}
+    .wrap {{ max-width:950px; margin:38px auto; padding:0 16px; }}
+    h1 {{ text-align:center; }}
+    .badge {{ font-size:12px; background:#eee; border-radius:999px; padding:3px 8px; }}
+    .card {{ border:1px solid #ddd; border-radius:12px; padding:18px; }}
+    textarea {{ width:100%; min-height:360px; margin-top:12px; border:1px solid #ccc; border-radius:10px; padding:12px; font:13px Consolas,monospace; }}
+    input[type=password] {{ padding:10px; border:1px solid #ccc; border-radius:10px; width:260px; }}
+    button {{ padding:10px 16px; border:0; border-radius:10px; background:#111; color:#fff; font-weight:bold; cursor:pointer; }}
+    .row {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:12px; }}
+    .hint {{ font-size:13px; color:#444; line-height:1.5; }}
+    .small {{ font-size:12px; color:#666; margin-top:8px; }}
   </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Roteirizador Privado <span class="badge">v{APP_VERSION}</span></h1>
-
   <div class="card">
     <div class="hint">
-      Cole a lista bagunçada (Shopee/Loggi/ML/etc).<br>
-      Formatos aceitos:
+      Aceita:
       <br>• nome + endereço + CEP em linhas separadas
       <br>• endereço com CEP na mesma linha
-      <br>• CEP com ou sem <b>CEP:</b>
-      <br><br>
-      Se o endereço ficar duvidoso, eu caio em fallback e marco em <b>Notes</b>.
+      <br>• CEP com ou sem "CEP:"
     </div>
 
     <form method="post" action="/process">
       <div class="row">
         <label><b>Senha:</b></label>
-        <input name="password" type="password" placeholder="APP_PASSWORD" required>
+        <input name="password" type="password" required>
         <button type="submit">Gerar CSV</button>
       </div>
 
-      <label style="display:block;margin-top:14px"><b>Cole aqui:</b></label>
-      <textarea name="text" placeholder="Cole aqui sua lista bagunçada..." required></textarea>
+      <label style="display:block; margin-top:14px;"><b>Cole aqui:</b></label>
+      <textarea name="text" required></textarea>
     </form>
 
-    <div class="small">
-      Saída: <b>circuit_import_site.csv</b> (download direto)
-    </div>
+    <div class="small">Saída: <b>circuit_import_site.csv</b></div>
   </div>
 </div>
 </body>
 </html>
 """
 
-# =========================
-# HELPERS
-# =========================
-def now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+def limpar(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
-def only_digits(s: str) -> str:
-    return re.sub(r"\D", "", s or "")
-
-def formata_cep(s: str) -> str:
-    d = only_digits(s)
-    return f"{d[:5]}-{d[5:]}" if len(d) == 8 else (s or "").strip()
-
-def normaliza(s: str) -> str:
-    s = (s or "").lower().strip()
-    s = re.sub(r"[^a-z0-9\s]", " ", s, flags=re.UNICODE)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def dentro_de_manaus(lat: float, lon: float) -> bool:
-    west, south, east, north = MANAUS_VIEWBOX
-    return west <= lon <= east and south <= lat <= north
-
-def limpar_texto(s: str) -> str:
-    s = (s or "").replace("\u00a0", " ").strip()
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def extrair_numero(endereco: str) -> str:
-    m = re.search(r"\b(\d{1,5}[A-Za-z]?)\b", re.sub(r"\b\d{8}\b", " ", endereco or ""))
-    return m.group(1) if m else "S/N"
-
-def canonicaliza_via(s: str) -> str:
-    s = limpar_texto(s)
-    s = re.sub(r"^\s*R\b\.?\s*", "Rua ", s, flags=re.IGNORECASE)
-    s = re.sub(r"^\s*AV\b\.?\s*", "Avenida ", s, flags=re.IGNORECASE)
-    s = re.sub(r"^\s*TV\b\.?\s*", "Travessa ", s, flags=re.IGNORECASE)
-    s = re.sub(r"^\s*TRAV\b\.?\s*", "Travessa ", s, flags=re.IGNORECASE)
-    s = re.sub(r"^\s*BCO\b\.?\s*", "Beco ", s, flags=re.IGNORECASE)
-    s = re.sub(r"^\s*EST\b\.?\s*", "Estrada ", s, flags=re.IGNORECASE)
-    return limpar_texto(s)
-
-def force_rua_if_rio(raw: str) -> str:
-    n = normaliza(raw)
-    if n.startswith("rio ") and ("rua" not in n):
-        return "Rua " + raw
-    return raw
-
-# =========================
-# CACHE
-# =========================
-def load_cache_csv(path: str) -> Dict[str, Dict[str, str]]:
-    out = {}
-    if not os.path.exists(path):
-        return out
-    try:
-        with open(path, "r", encoding="utf-8", newline="") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                k = (row.get("key") or "").strip()
-                if k:
-                    out[k] = row
-    except Exception:
-        return {}
-    return out
-
-def save_cache_csv(path: str, fieldnames: List[str], rows: Dict[str, Dict[str, str]]) -> None:
-    try:
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for _, row in rows.items():
-                w.writerow(row)
-    except Exception:
-        pass
-
-# =========================
-# VIACEP
-# =========================
-def viacep_get(cep_digits: str, viacep_cache: Dict[str, Dict[str, str]]) -> Optional[Dict[str, str]]:
-    cep_digits = only_digits(cep_digits)
-    if len(cep_digits) != 8:
-        return None
-
-    if cep_digits in viacep_cache:
-        return viacep_cache[cep_digits]
-
-    url = f"https://viacep.com.br/ws/{cep_digits}/json/"
-    try:
-        r = SESSION.get(url, timeout=12)
-        if r.status_code != 200:
-            return None
-        j = r.json()
-        if "erro" in j:
-            return None
-
-        data = {{
-            "key": cep_digits,
-            "cep": (j.get("cep") or "").strip(),
-            "logradouro": (j.get("logradouro") or "").strip(),
-            "bairro": (j.get("bairro") or "").strip(),
-            "localidade": (j.get("localidade") or "").strip(),
-            "uf": (j.get("uf") or "").strip(),
-            "updated_at": now_iso(),
-        }}
-        viacep_cache[cep_digits] = data
-        return data
-    except Exception:
-        return None
-
-# =========================
-# NOMINATIM
-# =========================
-def nominatim_search(query: str, bounded: bool, limit: int, timeout_s: float) -> List[Dict[str, Any]]:
-    url = "https://nominatim.openstreetmap.org/search"
-    west, south, east, north = MANAUS_VIEWBOX
-    params = {{
-        "q": query,
-        "format": "json",
-        "limit": int(limit),
-        "countrycodes": "br",
-        "addressdetails": 1,
-    }}
-    if bounded:
-        params["viewbox"] = f"{{west}},{{north}},{{east}},{{south}}"
-        params["bounded"] = 1
-
-    try:
-        r = SESSION.get(url, params=params, timeout=max(3.0, timeout_s))
-        time.sleep(SLEEP_NOMINATIM)
-        if r.status_code != 200:
-            return []
-        return r.json() or []
-    except Exception:
-        return []
-
-def resultado_e_lugar_ruim(item):
-    cls = (item.get("class") or "").lower()
-    typ = (item.get("type") or "").lower()
-    display = (item.get("display_name") or "").lower()
-
-    ruins_cls = {{"waterway", "natural"}}
-    ruins_typ = {{"river", "stream", "canal", "lake", "reservoir", "bay", "wetland"}}
-
-    if cls in ruins_cls:
-        return True
-    if typ in ruins_typ:
-        return True
-    if any(w in display for w in [" rio ", " igarapé", " igarape", " lago ", " canal "]):
-        if cls in ruins_cls or typ in ruins_typ:
-            return True
-    return False
-
-def pega_bairro_do_resultado(item):
-    addr = item.get("address") or {{}}
-    cand = (
-        addr.get("suburb")
-        or addr.get("neighbourhood")
-        or addr.get("city_district")
-        or addr.get("district")
-        or ""
-    )
-    return (cand or "").strip()
-
-def bairro_bate(bairro_esperado, item):
-    if not bairro_esperado:
-        return True
-    b = normaliza(bairro_esperado)
-    if not b:
-        return True
-    b_res = normaliza(pega_bairro_do_resultado(item)) or normaliza(item.get("display_name", ""))
-    if b in b_res:
-        return True
-    # match por "mestri" / "mestrinho" e semelhantes
-    if "mestri" in b and "mestri" in b_res:
-        return True
-    return False
-
-def escolher_melhor_candidato(candidatos, rua_raw, bairro_esperado):
-    import difflib
-
-    def sim(a, b):
-        a = normaliza(a)
-        b = normaliza(b)
-        if not a or not b:
-            return 0.0
-        return difflib.SequenceMatcher(None, a, b).ratio()
-
-    melhor = (None, None, -1.0, None)
-    for c in candidatos:
-        try:
-            lat = float(c.get("lat"))
-            lon = float(c.get("lon"))
-        except Exception:
-            continue
-
-        if not dentro_de_manaus(lat, lon):
-            continue
-        if resultado_e_lugar_ruim(c):
-            continue
-        if not bairro_bate(bairro_esperado, c):
-            continue
-
-        display = c.get("display_name", "") or ""
-        score = sim(rua_raw, display)
-
-        cls = (c.get("class") or "").lower()
-        typ = (c.get("type") or "").lower()
-        if cls in ("highway", "building", "amenity"):
-            score += 0.08
-        if typ in ("residential", "road", "house", "yes"):
-            score += 0.08
-
-        if score > melhor[2]:
-            melhor = (lat, lon, score, c)
-
-    if melhor[0] is not None:
-        return melhor[0], melhor[1], melhor[2], melhor[3]
-    return None, None, 0.0, None
-
-# =========================
-# PARSER
-# =========================
-RE_HAS_STREET = re.compile(r"\b(rua|r\b|avenida|av\b|travessa|tv\b|beco|estrada|alameda|praça|praca|rodovia|rio)\b", re.IGNORECASE)
-
-def extrair_cep_any(texto: str):
-    if not texto:
-        return None
-    m = re.search(r"(?:\bcep\b\s*:\s*)?(\d{5})[-\s]?(\d{3})", texto, flags=re.I)
+def extrair_cep(texto: str):
+    m = re.search(r"(?:\bcep\b\s*:\s*)?(\d{5})[-\s]?(\d{3})", texto or "", flags=re.I)
     if not m:
         return None
-    return (m.group(1) + m.group(2)).strip()
+    return f"{m.group(1)}-{m.group(2)}"
 
-def linha_tem_via(texto: str):
+def linha_tem_endereco(texto: str):
     t = (texto or "").lower()
-
-    if re.search(r"(^|\s)(r\.?|rua)\b", t):
+    if re.search(r"\b(rua|r\b|avenida|av\b|travessa|beco|estrada|alameda|praça|praca|rodovia|rio)\b", t):
         return True
-    if re.search(r"\b(av\.?|avenida)\b", t):
+    if re.search(r",\s*\d{1,6}\b", texto or "") and "manaus" in t:
         return True
-    if re.search(r"\b(travessa|beco|estrada|alameda|praça|praca|rodovia|rio)\b", t):
-        return True
+    return False
 
-    tem_numero = bool(re.search(r",\s*\d{1,6}\b", texto or ""))
-    tem_manaus = "manaus" in t
-    return tem_numero and tem_manaus
+def is_nome(texto: str):
+    if not texto:
+        return False
+    if extrair_cep(texto):
+        return False
+    if linha_tem_endereco(texto):
+        return False
+    if re.search(r"\d", texto):
+        return False
+    return len(texto.split()) >= 2
 
-def is_linha_nome(s: str):
-    if not s:
-        return False
-    if extrair_cep_any(s):
-        return False
-    if linha_tem_via(s):
-        return False
-    if re.search(r"\d", s):
-        return False
-    toks = [t for t in s.split() if t.strip()]
-    return len(toks) >= 2
-
-def extrair_bairro_de_endereco(endereco: str):
-    parts = [p.strip() for p in re.split(r"\s-\s", endereco)]
-    if len(parts) >= 2:
-        bairro = parts[1].strip()
-        bairro = re.sub(r"\b(manaus|am|amazonas)\b", "", bairro, flags=re.IGNORECASE).strip()
-        if bairro and len(bairro) >= 3:
-            return bairro
+def extrair_bairro(endereco: str):
+    partes = [p.strip() for p in re.split(r"\s-\s", endereco or "")]
+    if len(partes) >= 2:
+        return partes[1]
     return ""
 
-def strip_cep_text(s: str):
-    s = re.sub(r"\bCEP\b\s*:?\s*\d{5}-?\d{3}\b", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\b\d{5}-?\d{3}\b", "", s)
-    s = re.sub(r"\b\d{8}\b", "", s)
-    return limpar_texto(s)
-
-def parse_entregas(texto_colado: str):
-    linhas = [limpar_texto(l) for l in (texto_colado or "").splitlines()]
-    raw_lines = [l for l in linhas]
-
+def parse_lista(texto: str):
+    linhas = [limpar(l) for l in (texto or "").splitlines() if limpar(l)]
     entregas = []
     i = 0
 
-    while i < len(raw_lines):
-        line = raw_lines[i].strip()
-        if not line:
-            i += 1
-            continue
+    while i < len(linhas):
+        linha = linhas[i]
 
-        # nome / endereço / cep
-        if is_linha_nome(line):
-            nome = line
-            endereco = ""
-            cep8d = None
+        # modelo nome / endereço / cep
+        if is_nome(linha) and i + 2 < len(linhas):
+            nome = linha
+            endereco = linhas[i + 1]
+            cep = extrair_cep(linhas[i + 2]) or extrair_cep(endereco)
 
-            if i + 1 < len(raw_lines) and raw_lines[i + 1].strip():
-                poss_end = raw_lines[i + 1].strip()
-                if linha_tem_via(poss_end):
-                    endereco = poss_end
+            if linha_tem_endereco(endereco) and cep:
+                entregas.append({
+                    "nome": nome,
+                    "endereco": endereco,
+                    "bairro": extrair_bairro(endereco),
+                    "cep": cep
+                })
+                i += 3
+                continue
 
-                    if i + 2 < len(raw_lines):
-                        cep8d = extrair_cep_any(raw_lines[i + 2].strip())
+        # modelo endereço / cep
+        if linha_tem_endereco(linha):
+            cep = extrair_cep(linha)
+            if not cep and i + 1 < len(linhas):
+                cep = extrair_cep(linhas[i + 1])
 
-                    if not cep8d:
-                        cep8d = extrair_cep_any(endereco)
-
-                    if endereco and cep8d:
-                        entregas.append({{
-                            "nome": nome,
-                            "endereco_raw": strip_cep_text(endereco),
-                            "bairro_raw": extrair_bairro_de_endereco(endereco),
-                            "cep8": cep8d
-                        }})
-                        i += 3
-                        continue
-
-        # endereço com cep na mesma ou próxima linha
-        if linha_tem_via(line):
-            endereco = line
-            cep8d = extrair_cep_any(line)
-
-            if not cep8d and i + 1 < len(raw_lines):
-                cep8d = extrair_cep_any(raw_lines[i + 1].strip())
-
-            if cep8d:
-                entregas.append({{
+            if cep:
+                entregas.append({
                     "nome": "",
-                    "endereco_raw": strip_cep_text(endereco),
-                    "bairro_raw": extrair_bairro_de_endereco(endereco),
-                    "cep8": cep8d
-                }})
+                    "endereco": linha,
+                    "bairro": extrair_bairro(linha),
+                    "cep": cep
+                })
                 i += 2
                 continue
 
-        # rua / bairro / cep
-        if i + 2 < len(raw_lines):
-            l1 = raw_lines[i].strip()
-            l2 = raw_lines[i + 1].strip()
-            l3 = raw_lines[i + 2].strip()
-
-            c3 = extrair_cep_any(l3)
-            if c3 and ((linha_tem_via(l1) or re.search(r",\s*\d", l1)) and not extrair_cep_any(l1)):
-                endereco = f"{{l1}} - {{l2}} - MANAUS/AM"
-                entregas.append({{
+        # modelo rua / bairro / cep
+        if i + 2 < len(linhas):
+            l1, l2, l3 = linhas[i], linhas[i + 1], linhas[i + 2]
+            cep = extrair_cep(l3)
+            if cep and (linha_tem_endereco(l1) or re.search(r",\s*\d", l1)):
+                endereco = f"{l1} - {l2} - MANAUS/AM"
+                entregas.append({
                     "nome": "",
-                    "endereco_raw": strip_cep_text(endereco),
-                    "bairro_raw": l2,
-                    "cep8": c3
-                }})
+                    "endereco": endereco,
+                    "bairro": l2,
+                    "cep": cep
+                })
                 i += 3
                 continue
 
         i += 1
 
-    entregas = [e for e in entregas if len(only_digits(e.get("cep8", ""))) == 8]
     return entregas
 
-# =========================
-# GEOCODIFICAR
-# =========================
-def make_cache_key(cep_fmt, numero, bairro, base_rua):
-    return f"{{cep_fmt}}|{{str(numero).upper()}}|{{normaliza(bairro)}}|{{normaliza(base_rua)}}"
-
-def geocodificar_entrega(entrega, geocode_cache, viacep_cache):
-    start = time.monotonic()
-
-    def estourou():
-        return (time.monotonic() - start) > MAX_SECONDS_PER_ADDRESS
-
-    cep8d = only_digits(entrega.get("cep8", ""))
-    cep_fmt = formata_cep(cep8d)
-    endereco_raw = (entrega.get("endereco_raw") or "").strip()
-    rua_lista = canonicaliza_via(endereco_raw)
-    rua_lista = force_rua_if_rio(rua_lista)
-    numero = extrair_numero(rua_lista)
-
-    via = viacep_get(cep8d, viacep_cache)
-    if not via:
-        bairro_alvo = BAIRRO_FIXO or entrega.get("bairro_raw", "")
-        dest = f"{{rua_lista or cep_fmt}}, {{numero}}, {{bairro_alvo}}, Manaus-AM".strip(", ")
-        return None, None, bairro_alvo, dest, "FALLBACK: VIACEP_FALHOU", False
-
-    if normaliza(via.get("localidade")) != "manaus":
-        bairro_alvo = BAIRRO_FIXO or entrega.get("bairro_raw", "") or via.get("bairro", "")
-        dest = f"{{via.get('logradouro','') or rua_lista}}, {{numero}}, {{bairro_alvo}}, {{via.get('localidade','')}}-{{via.get('uf','')}}".strip(", ")
-        return None, None, bairro_alvo, dest, f"FALLBACK: CEP_FORA_MANAUS ({{via.get('localidade','')}})", False
-
-    via_logradouro = via.get("logradouro", "")
-    via_bairro = via.get("bairro", "")
-    city = via.get("localidade", "Manaus") or "Manaus"
-    uf = via.get("uf", "AM") or "AM"
-
-    bairro_alvo = BAIRRO_FIXO or entrega.get("bairro_raw", "") or via_bairro
-
-    base_rua = via_logradouro or rua_lista or endereco_raw or cep_fmt
-    ck = make_cache_key(cep_fmt, numero, bairro_alvo, base_rua)
-
-    if ck in geocode_cache:
-        try:
-            lat = float(geocode_cache[ck]["lat"])
-            lon = float(geocode_cache[ck]["lon"])
-            if dentro_de_manaus(lat, lon):
-                dest = f"{{via_logradouro or rua_lista}}, {{numero}}".strip(", ")
-                return lat, lon, bairro_alvo, dest, "CACHE", True
-        except Exception:
-            pass
-
-    queries = []
-    if cep_fmt:
-        queries.append(f"{{cep_fmt}}, {{numero}}, {{bairro_alvo}}, {{city}}-{{uf}}, {{COUNTRY}}")
-    if via_logradouro:
-        queries.append(f"{{canonicaliza_via(via_logradouro)}}, {{numero}}, {{bairro_alvo}}, {{city}}-{{uf}}, {{cep_fmt}}, {{COUNTRY}}")
-    if rua_lista:
-        queries.append(f"{{rua_lista}}, {{numero}}, {{bairro_alvo}}, {{city}}-{{uf}}, {{cep_fmt}}, {{COUNTRY}}")
-    if via_logradouro:
-        queries.append(f"{{canonicaliza_via(via_logradouro)}}, {{bairro_alvo}}, {{city}}-{{uf}}, {{cep_fmt}}, {{COUNTRY}}")
-
-    melhor_lat = melhor_lon = None
-    melhor_score = -1.0
-    melhor_note = ""
-
-    for q_idx, q in enumerate(queries, start=1):
-        if estourou():
-            break
-
-        cand = nominatim_search(q, bounded=True, limit=5, timeout_s=8)
-        lat, lon, score, item = escolher_melhor_candidato(cand, rua_lista or endereco_raw or q, bairro_alvo)
-
-        if lat is not None and score > melhor_score:
-            melhor_lat, melhor_lon, melhor_score = lat, lon, score
-            melhor_note = f"NOMINATIM_BOUNDED(q{{q_idx}},score={{score:.2f}})"
-            if score >= 0.78:
-                break
-
-        if estourou():
-            break
-
-        cand2 = nominatim_search(q, bounded=False, limit=5, timeout_s=8)
-        lat2, lon2, score2, item2 = escolher_melhor_candidato(cand2, rua_lista or endereco_raw or q, bairro_alvo)
-
-        if lat2 is not None and score2 > melhor_score:
-            melhor_lat, melhor_lon, melhor_score = lat2, lon2, score2
-            melhor_note = f"NOMINATIM_FREE(q{{q_idx}},score={{score2:.2f}})"
-            if score2 >= 0.78:
-                break
-
-    if melhor_lat is not None and melhor_lon is not None and dentro_de_manaus(melhor_lat, melhor_lon):
-        geocode_cache[ck] = {{
-            "key": ck,
-            "lat": str(melhor_lat),
-            "lon": str(melhor_lon),
-            "updated_at": now_iso(),
-        }}
-        dest = f"{{via_logradouro or rua_lista}}, {{numero}}".strip(", ")
-        return melhor_lat, melhor_lon, bairro_alvo, dest, melhor_note, False
-
-    dest = f"{{via_logradouro or rua_lista}}, {{numero}}".strip(", ")
-    if not dest:
-        dest = f"{{bairro_alvo}}, Manaus-AM, {{cep_fmt}}"
-    return None, None, bairro_alvo, dest, "FALLBACK: NAO_ENCONTRADO", False
-
-# =========================
-# ROUTES
-# =========================
 @app.get("/")
 def home():
     return render_template_string(HTML)
@@ -571,41 +167,31 @@ def process():
     if not text.strip():
         abort(400, "Texto vazio.")
 
-    geocode_cache = load_cache_csv(GEOCODE_CACHE_FILE)
-    viacep_cache = load_cache_csv(VIACEP_CACHE_FILE)
-
-    entregas = parse_entregas(text)
+    entregas = parse_lista(text)
 
     if not entregas:
         abort(400, "Não achei endereços. Pode colar no formato nome + endereço + CEP em linhas separadas.")
 
-    if len(entregas) > MAX_TOTAL_ADDRESSES:
-        abort(400, f"Lista grande demais ({len(entregas)}). Limite: {MAX_TOTAL_ADDRESSES}.")
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["Sequence", "Destination Address", "Bairro", "City", "Zipcode/Postal Code", "Latitude", "Longitude", "Notes"])
 
-    ok_rows = []
-
-    for idx, ent in enumerate(entregas, start=1):
-        lat, lon, bairro, dest, note, used_cache = geocodificar_entrega(ent, geocode_cache, viacep_cache)
-        cep_fmt = formata_cep(ent.get("cep8", ""))
-
-        ok_rows.append([
-            idx,
-            dest,
-            bairro,
+    for i, e in enumerate(entregas, start=1):
+        w.writerow([
+            i,
+            e["endereco"],
+            e["bairro"],
             "Manaus",
-            cep_fmt,
-            f"{lat:.6f}" if isinstance(lat, float) else "",
-            f"{lon:.6f}" if isinstance(lon, float) else "",
-            note
+            e["cep"],
+            "",
+            "",
+            e["nome"]
         ])
 
-    save_cache_csv(GEOCODE_CACHE_FILE, ["key", "lat", "lon", "updated_at"], geocode_cache)
-    save_cache_csv(VIACEP_CACHE_FILE, ["key", "cep", "logradouro", "bairro", "localidade", "uf", "updated_at"], viacep_cache)
-
-    csv_bytes = build_csv(ok_rows)
+    data = out.getvalue().encode("utf-8")
 
     return send_file(
-        io.BytesIO(csv_bytes),
+        io.BytesIO(data),
         mimetype="text/csv",
         as_attachment=True,
         download_name="circuit_import_site.csv"
